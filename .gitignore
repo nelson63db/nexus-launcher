@@ -13,6 +13,7 @@ projects.json
 apps/
 scripts/
 docs/
+nexus-private/
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # IDE & Editor Files

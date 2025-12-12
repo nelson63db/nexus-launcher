@@ -89,9 +89,85 @@ MATRIX_CHARS = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅ�
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DATA_FILE = "projects.json"
-APPS_DIR = "apps"      # Directory for external Python programs
-SCRIPTS_DIR = "scripts"  # Directory for system scripts
+# Get the directory where this script is located
+SCRIPT_DIR = Path(__file__).parent.resolve()
+
+# Private data directory (excluded from public git)
+PRIVATE_DIR = SCRIPT_DIR / "nexus-private"
+
+# Paths for user data
+DATA_FILE = PRIVATE_DIR / "projects.json"
+APPS_DIR = PRIVATE_DIR / "apps"
+SCRIPTS_DIR = PRIVATE_DIR / "scripts"
+
+
+def init_private_directory():
+    """Create nexus-private directory structure if it doesn't exist."""
+    if not PRIVATE_DIR.exists():
+        PRIVATE_DIR.mkdir(parents=True)
+        print(f"  {C.CYAN}Created:{C.RESET} {PRIVATE_DIR}/")
+
+    for subdir in [APPS_DIR, SCRIPTS_DIR]:
+        if not subdir.exists():
+            subdir.mkdir(parents=True)
+            print(f"  {C.CYAN}Created:{C.RESET} {subdir}/")
+
+    # Create template files for new users
+    apps_template = APPS_DIR / "_template.py.example"
+    if not apps_template.exists():
+        apps_template.write_text('''#!/usr/bin/env python3
+"""
+Template for NEXUS external programs.
+Rename this file to your_app.py and implement main()
+"""
+
+def main():
+    """Entry point for the application."""
+    print("Hello from your NEXUS app!")
+    # Your code here
+    return 0  # Return 0 for success
+
+if __name__ == "__main__":
+    exit(main())
+''')
+
+    scripts_template = SCRIPTS_DIR / "_template.sh.example"
+    if not scripts_template.exists():
+        scripts_template.write_text('''#!/bin/bash
+# Description: Template script for NEXUS
+# Rename this file to your_script.sh
+
+echo "Hello from your NEXUS script!"
+# Your commands here
+''')
+
+    # Create README for nexus-private
+    private_readme = PRIVATE_DIR / "README.md"
+    if not private_readme.exists():
+        private_readme.write_text('''# NEXUS Private Data
+
+This directory contains your personal data for NEXUS launcher.
+It is excluded from the public repository via .gitignore.
+
+## Contents
+
+- `apps/` - Your Python programs (must have a `main()` function)
+- `scripts/` - Your shell scripts (.sh, .py, .bash)
+- `projects.json` - Your tmux project configurations
+
+## Backup Recommendation
+
+Initialize a private git repository here to backup your personal data:
+
+```bash
+cd nexus-private
+git init
+git add .
+git commit -m "Initial backup"
+git remote add origin git@github.com:YOUR_USER/nexus-private.git
+git push -u origin main
+```
+''')
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UTILITY FUNCTIONS
@@ -343,28 +419,6 @@ class ExternalProgramsManager:
 
     def __init__(self, apps_dir=APPS_DIR):
         self.apps_dir = Path(apps_dir)
-        self._ensure_dir_exists()
-
-    def _ensure_dir_exists(self):
-        if not self.apps_dir.exists():
-            self.apps_dir.mkdir(parents=True)
-            # Create a sample app template
-            sample = self.apps_dir / "_template.py.example"
-            sample.write_text('''#!/usr/bin/env python3
-"""
-Template for NEXUS external programs.
-Rename this file to your_app.py and implement main()
-"""
-
-def main():
-    """Entry point for the application."""
-    print("Hello from your NEXUS app!")
-    # Your code here
-    return 0  # Return 0 for success
-
-if __name__ == "__main__":
-    exit(main())
-''')
 
     def list_programs(self):
         """List all available Python programs."""
@@ -445,20 +499,6 @@ class SystemScriptsManager:
 
     def __init__(self, scripts_dir=SCRIPTS_DIR):
         self.scripts_dir = Path(scripts_dir)
-        self._ensure_dir_exists()
-
-    def _ensure_dir_exists(self):
-        if not self.scripts_dir.exists():
-            self.scripts_dir.mkdir(parents=True)
-            # Create example script
-            example = self.scripts_dir / "_example.sh"
-            example.write_text('''#!/bin/bash
-# Example system script for NEXUS
-# Description: Template script
-
-echo "This is an example script"
-echo "Rename to your_script.sh and make executable with chmod +x"
-''')
 
     def list_scripts(self):
         """List all available scripts."""
@@ -910,6 +950,9 @@ class NexusApp:
 
 def main():
     """Entry point for NEXUS."""
+    # Initialize private directory structure
+    init_private_directory()
+
     app = NexusApp()
 
     # Check for command line arguments for quick launch
