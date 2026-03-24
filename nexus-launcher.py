@@ -624,6 +624,12 @@ class NexusApp:
         h_size = self.manager.global_config['default_h_split']
         v_size = self.manager.global_config['default_v_split']
 
+        # Main panel (Top-left)
+        print(f"\n  {C.YELLOW}[Top-Left Panel - Main]{C.RESET}")
+        main_cmd = prompt("Command to execute (optional)", "")
+        main_cd = confirm("Enter project directory?")
+        main_venv = confirm("Activate virtual environment?")
+
         # Server panel (Right)
         print(f"\n  {C.YELLOW}[Right Panel - Server]{C.RESET} {C.DIM}({h_size}% width){C.RESET}")
         srv_cmd = prompt("Command to execute (e.g., runserver)", "")
@@ -642,7 +648,7 @@ class NexusApp:
         ]
 
         panes = [
-            PaneConfig("Main", True, True, None),
+            PaneConfig("Main", main_cd, main_venv, main_cmd if main_cmd else None),
             PaneConfig("Server", srv_cd, srv_venv, srv_cmd if srv_cmd else None),
             PaneConfig("Extra", ext_cd, ext_venv, ext_cmd if ext_cmd else None)
         ]
@@ -669,6 +675,104 @@ class NexusApp:
                 show_success(f"Project '{project.alias}' deleted")
         else:
             show_error("Project not found")
+
+    def edit_project_ui(self):
+        """Edit an existing project's pane configurations."""
+        if not self.manager.projects:
+            show_warning("No projects to edit")
+            return
+
+        print_header("EDIT PROJECT")
+        self._display_projects_list()
+
+        choice = prompt("Enter project number or alias to edit")
+        project = self.manager.get_project(choice)
+
+        if not project:
+            show_error("Project not found")
+            return
+
+        while True:
+            clear_screen()
+            print(NEXUS_LOGO)
+            print_header(f"EDITING: {project.alias}")
+
+            # Show current config
+            print(f"\n  {C.CYAN}General{C.RESET}")
+            print(f"  {C.BRIGHT_BLACK}{'─' * 50}{C.RESET}")
+            print(f"  {C.YELLOW}1{C.RESET} │ Alias          : {C.GREEN}{project.alias}{C.RESET}")
+            print(f"  {C.YELLOW}2{C.RESET} │ Path           : {C.GREEN}{project.path}{C.RESET}")
+            print(f"  {C.YELLOW}3{C.RESET} │ Venv path      : {C.GREEN}{project.venv_path}{C.RESET}")
+            print(f"  {C.YELLOW}4{C.RESET} │ Activation cmd : {C.GREEN}{project.activation_cmd}{C.RESET}")
+
+            print(f"\n  {C.CYAN}Panes{C.RESET}")
+            print(f"  {C.BRIGHT_BLACK}{'─' * 50}{C.RESET}")
+            for i, pane in enumerate(project.panes_config):
+                cd_status = f"{C.GREEN}Yes{C.RESET}" if pane.use_cd else f"{C.RED}No{C.RESET}"
+                venv_status = f"{C.GREEN}Yes{C.RESET}" if pane.use_venv else f"{C.RED}No{C.RESET}"
+                cmd_display = pane.custom_cmd if pane.custom_cmd else f"{C.DIM}(none){C.RESET}"
+                label = chr(ord('A') + i)
+                print(f"  {C.YELLOW}[{label}]{C.RESET} │ {C.BOLD}{pane.name:<10}{C.RESET} cd:{cd_status}  venv:{venv_status}  cmd: {cmd_display}")
+
+            print(f"\n  {C.YELLOW}[B]{C.RESET} │ Back (save & exit)")
+            print()
+
+            opt = prompt("Option").strip()
+
+            if opt.lower() == 'b':
+                self.manager.save_projects()
+                show_success(f"Project '{project.alias}' saved")
+                break
+
+            elif opt == '1':
+                new_val = prompt("New alias", project.alias)
+                if new_val:
+                    project.alias = new_val
+
+            elif opt == '2':
+                new_val = prompt("New path", project.path)
+                if new_val:
+                    project.path = new_val
+
+            elif opt == '3':
+                new_val = prompt("New venv path", project.venv_path)
+                project.venv_path = new_val
+
+            elif opt == '4':
+                new_val = prompt("New activation command", project.activation_cmd)
+                if new_val:
+                    project.activation_cmd = new_val
+
+            elif opt.upper() in [chr(ord('A') + i) for i in range(len(project.panes_config))]:
+                pane_idx = ord(opt.upper()) - ord('A')
+                pane = project.panes_config[pane_idx]
+                self._edit_pane(pane)
+
+            else:
+                show_error("Invalid option")
+                time.sleep(0.5)
+
+    def _edit_pane(self, pane):
+        """Edit a single pane configuration."""
+        print(f"\n  {C.CYAN}─── Editing pane: {pane.name} ───{C.RESET}")
+
+        new_name = prompt("Pane name", pane.name)
+        if new_name:
+            pane.name = new_name
+
+        pane.use_cd = confirm("Enter project directory?", pane.use_cd)
+        pane.use_venv = confirm("Activate virtual environment?", pane.use_venv)
+
+        if pane.custom_cmd:
+            print(f"  {C.DIM}Current command: {pane.custom_cmd}{C.RESET}")
+        new_cmd = prompt("Command to execute (empty to clear)")
+        if new_cmd:
+            pane.custom_cmd = new_cmd
+        else:
+            pane.custom_cmd = None
+
+        show_success(f"Pane '{pane.name}' updated")
+        time.sleep(0.5)
 
     def _display_projects_list(self):
         """Display formatted project list."""
@@ -841,8 +945,9 @@ class NexusApp:
   {C.CYAN}Quick Actions{C.RESET}                    {C.CYAN}System Tools{C.RESET}
   {C.BRIGHT_BLACK}──────────────{C.RESET}                    {C.BRIGHT_BLACK}────────────{C.RESET}
   {C.YELLOW}[N]{C.RESET} New project                 {C.YELLOW}[P]{C.RESET} External programs
-  {C.YELLOW}[C]{C.RESET} Configuration               {C.YELLOW}[S]{C.RESET} System scripts
-  {C.YELLOW}[Q]{C.RESET} Quit                        {C.YELLOW}[H]{C.RESET} Help
+  {C.YELLOW}[E]{C.RESET} Edit project                {C.YELLOW}[S]{C.RESET} System scripts
+  {C.YELLOW}[C]{C.RESET} Configuration               {C.YELLOW}[H]{C.RESET} Help
+  {C.YELLOW}[Q]{C.RESET} Quit
 """)
         print_divider('═')
 
@@ -912,6 +1017,10 @@ class NexusApp:
 
                 elif choice_lower == 'n':
                     self.create_project_ui()
+                    input(f"\n  {C.DIM}Press ENTER to continue...{C.RESET}")
+
+                elif choice_lower == 'e':
+                    self.edit_project_ui()
                     input(f"\n  {C.DIM}Press ENTER to continue...{C.RESET}")
 
                 elif choice_lower == 'c':
