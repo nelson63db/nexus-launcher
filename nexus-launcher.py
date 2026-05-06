@@ -714,12 +714,12 @@ class NexusApp:
                 label = chr(ord('A') + i)
                 print(f"  {C.YELLOW}[{label}]{C.RESET} │ {C.BOLD}{pane.name:<10}{C.RESET} cd:{cd_status}  venv:{venv_status}  cmd: {cmd_display}")
 
-            print(f"\n  {C.YELLOW}[B]{C.RESET} │ Back (save & exit)")
+            print(f"\n  {C.YELLOW}[X]{C.RESET} │ Back (save & exit)")
             print()
 
             opt = prompt("Option").strip()
 
-            if opt.lower() == 'b':
+            if opt.lower() == 'x':
                 self.manager.save_projects()
                 show_success(f"Project '{project.alias}' saved")
                 break
