@@ -8,6 +8,9 @@ import os
 import sys
 import json
 import time
+import select
+import tty
+import termios
 import subprocess
 import importlib.util
 from pathlib import Path
@@ -238,6 +241,80 @@ def show_warning(message):
 def show_info(message):
     print(f"  {C.CYAN}ℹ{C.RESET} {message}")
 
+def animated_menu_prompt(prompt_text):
+    """Styled input prompt with intense cyberpunk animation."""
+    # Multi-layer spinners for intense effect (fixed width so text doesn't shift)
+    _spinner_main = ['█▄', '▄█', '█▀', '▀█', '●▮', '▮●', '◆◇', '◇◆']
+    _spinner_side = ['◄  ', '◄◄ ', '◄◄◄', '◄◄ ', '◄  ', '►  ', '►► ', '►►►', '►► ', '►  ']
+    _statuses = [
+        ('NEXUS ACTIVE      ', C.BRIGHT_CYAN),
+        ('SYS_LOCKED       ', C.BRIGHT_MAGENTA),
+        ('FIREWALL UP      ', C.BRIGHT_GREEN),
+        ('NEURAL_NET ON    ', C.BRIGHT_YELLOW),
+        ('CRYPTO_ENGAGED   ', C.BRIGHT_CYAN),
+        ('DAEMON_RUNNING   ', C.BRIGHT_RED),
+        ('STREAM_ONLINE    ', C.BRIGHT_MAGENTA),
+        ('NODE_CONNECTED   ', C.BRIGHT_GREEN),
+        ('SIGNAL_STRONG    ', C.BRIGHT_YELLOW),
+        ('PROTOCOL_OK      ', C.BRIGHT_CYAN),
+    ]
+
+    sys.stdout.write(f"  {C.BRIGHT_CYAN}◆{C.RESET} {C.DIM}NEXUS ACTIVE{C.RESET}\n")
+    sys.stdout.write(f"  {C.BRIGHT_MAGENTA}>{C.RESET} {prompt_text}: ")
+    sys.stdout.flush()
+
+    if not sys.stdin.isatty():
+        return input("").strip()
+
+    result = ""
+    frame  = 0
+    fd     = sys.stdin.fileno()
+    old    = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.15)
+            if r:
+                ch = sys.stdin.read(1)
+                if ch in ('\r', '\n'):
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    break
+                elif ch in ('\x7f', '\x08'):
+                    if result:
+                        result = result[:-1]
+                        sys.stdout.write('\b \b')
+                        sys.stdout.flush()
+                elif ch == '\x03':
+                    raise KeyboardInterrupt
+                elif ch == '\x1b':
+                    while select.select([sys.stdin], [], [], 0)[0]:
+                        sys.stdin.read(1)
+                elif ch >= ' ':
+                    result += ch
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
+
+            # Animated status with color cycling
+            sp_main = _spinner_main[frame % len(_spinner_main)]
+            sp_side_l = _spinner_side[frame % len(_spinner_side)]
+            sp_side_r = _spinner_side[-(frame % len(_spinner_side))-1]
+
+            status_idx = (frame // 3) % len(_statuses)
+            status_text, status_color = _statuses[status_idx]
+
+            # Glitch effect occasionally
+            if frame % 12 == 0:
+                status_text = status_text.replace(' ', '█')
+
+            sys.stdout.write(f"\033[s\033[A\r  {sp_side_l}{C.RESET} {status_color}{sp_main} {status_text}{C.RESET} {sp_side_r}\033[u")
+            sys.stdout.flush()
+            frame += 1
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    return result.strip()
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA MODELS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -390,17 +467,19 @@ class TmuxOrchestrator:
             subprocess.run(cmd, capture_output=True)
 
         # Configure each pane
-        if len(project.panes_config) > 0:
-            cmds = self._build_cmds(project, project.panes_config[0])
-            self._send_keys(0, cmds)
-
-        if len(project.panes_config) > 2:
-            cmds = self._build_cmds(project, project.panes_config[2])
-            self._send_keys(1, cmds)
-
-        if len(project.panes_config) > 1:
-            cmds = self._build_cmds(project, project.panes_config[1])
-            self._send_keys(2, cmds)
+        n = len(project.panes_config)
+        if n == 2:
+            # Simple horizontal split: pane 0 = left, pane 1 = right
+            self._send_keys(0, self._build_cmds(project, project.panes_config[0]))
+            self._send_keys(1, self._build_cmds(project, project.panes_config[1]))
+        else:
+            # 3-pane layout: pane 0 = top-left, pane 1 = extra (right), pane 2 = server (bottom-left)
+            if n > 0:
+                self._send_keys(0, self._build_cmds(project, project.panes_config[0]))
+            if n > 2:
+                self._send_keys(1, self._build_cmds(project, project.panes_config[2]))
+            if n > 1:
+                self._send_keys(2, self._build_cmds(project, project.panes_config[1]))
 
         # Rename window and set focus
         subprocess.run(['tmux', 'rename-window', project.alias], capture_output=True)
@@ -613,45 +692,56 @@ class NexusApp:
             return
 
         path = prompt("Absolute project path")
-        venv = prompt("Absolute venv path")
+        venv = prompt("Absolute venv path (empty = no venv)", "")
 
-        default_activate = f"source {os.path.join(venv, 'bin', 'activate')}"
+        if venv:
+            default_activate = f"source {os.path.join(venv, 'bin', 'activate')}"
+        else:
+            default_activate = "echo ."
         act_cmd = prompt("Venv activation command", default_activate)
 
-        # Panel configuration
         print(f"\n  {C.CYAN}─── Panel Configuration ───{C.RESET}")
-
         h_size = self.manager.global_config['default_h_split']
         v_size = self.manager.global_config['default_v_split']
 
-        # Main panel (Top-left)
-        print(f"\n  {C.YELLOW}[Top-Left Panel - Main]{C.RESET}")
-        main_cmd = prompt("Command to execute (optional)", "")
-        main_cd = confirm("Enter project directory?")
+        three_panes = confirm("Use 3 panels? (No = 2 panels)", default=True)
+
+        # Main panel (always)
+        print(f"\n  {C.YELLOW}[Left / Main Panel]{C.RESET}")
+        main_cmd  = prompt("Command to execute (optional)", "")
+        main_cd   = confirm("Enter project directory?")
         main_venv = confirm("Activate virtual environment?")
 
-        # Server panel (Right)
-        print(f"\n  {C.YELLOW}[Right Panel - Server]{C.RESET} {C.DIM}({h_size}% width){C.RESET}")
-        srv_cmd = prompt("Command to execute (e.g., runserver)", "")
-        srv_cd = confirm("Enter project directory?")
+        # Right panel (always)
+        print(f"\n  {C.YELLOW}[Right Panel]{C.RESET} {C.DIM}({h_size}% width){C.RESET}")
+        srv_cmd  = prompt("Command to execute (optional)", "")
+        srv_cd   = confirm("Enter project directory?")
         srv_venv = confirm("Activate virtual environment?")
 
-        # Extra panel (Bottom-left)
-        print(f"\n  {C.YELLOW}[Bottom-Left Panel - Extra]{C.RESET} {C.DIM}({v_size}% height){C.RESET}")
-        ext_cmd = prompt("Command to execute (optional)", "")
-        ext_cd = confirm("Enter project directory?")
-        ext_venv = confirm("Activate virtual environment?")
+        if three_panes:
+            # Bottom-left panel (optional)
+            print(f"\n  {C.YELLOW}[Bottom-Left Panel]{C.RESET} {C.DIM}({v_size}% height){C.RESET}")
+            ext_cmd  = prompt("Command to execute (optional)", "")
+            ext_cd   = confirm("Enter project directory?")
+            ext_venv = confirm("Activate virtual environment?")
 
-        layout = [
-            {'direction': 'h', 'percent': h_size, 'target': None},
-            {'direction': 'v', 'percent': v_size, 'target': '0'}
-        ]
-
-        panes = [
-            PaneConfig("Main", main_cd, main_venv, main_cmd if main_cmd else None),
-            PaneConfig("Server", srv_cd, srv_venv, srv_cmd if srv_cmd else None),
-            PaneConfig("Extra", ext_cd, ext_venv, ext_cmd if ext_cmd else None)
-        ]
+            layout = [
+                {'direction': 'h', 'percent': h_size, 'target': None},
+                {'direction': 'v', 'percent': v_size, 'target': '0'}
+            ]
+            panes = [
+                PaneConfig("Main",   main_cd,  main_venv,  main_cmd  or None),
+                PaneConfig("Server", srv_cd,   srv_venv,   srv_cmd   or None),
+                PaneConfig("Extra",  ext_cd,   ext_venv,   ext_cmd   or None),
+            ]
+        else:
+            layout = [
+                {'direction': 'h', 'percent': h_size, 'target': None}
+            ]
+            panes = [
+                PaneConfig("Main",   main_cd,  main_venv,  main_cmd  or None),
+                PaneConfig("Server", srv_cd,   srv_venv,   srv_cmd   or None),
+            ]
 
         new_proj = Project(alias, path, venv, act_cmd, layout, panes)
         self.manager.add_project(new_proj)
@@ -705,7 +795,8 @@ class NexusApp:
             print(f"  {C.YELLOW}3{C.RESET} │ Venv path      : {C.GREEN}{project.venv_path}{C.RESET}")
             print(f"  {C.YELLOW}4{C.RESET} │ Activation cmd : {C.GREEN}{project.activation_cmd}{C.RESET}")
 
-            print(f"\n  {C.CYAN}Panes{C.RESET}")
+            pane_count = len(project.panes_config)
+            print(f"\n  {C.CYAN}Panes{C.RESET} {C.DIM}({pane_count} total){C.RESET}")
             print(f"  {C.BRIGHT_BLACK}{'─' * 50}{C.RESET}")
             for i, pane in enumerate(project.panes_config):
                 cd_status = f"{C.GREEN}Yes{C.RESET}" if pane.use_cd else f"{C.RED}No{C.RESET}"
@@ -713,6 +804,11 @@ class NexusApp:
                 cmd_display = pane.custom_cmd if pane.custom_cmd else f"{C.DIM}(none){C.RESET}"
                 label = chr(ord('A') + i)
                 print(f"  {C.YELLOW}[{label}]{C.RESET} │ {C.BOLD}{pane.name:<10}{C.RESET} cd:{cd_status}  venv:{venv_status}  cmd: {cmd_display}")
+
+            if pane_count < 3:
+                print(f"  {C.YELLOW}[+]{C.RESET} │ Add panel (current: {pane_count} → 3)")
+            if pane_count > 2:
+                print(f"  {C.YELLOW}[-]{C.RESET} │ Remove last panel (current: {pane_count} → 2)")
 
             print(f"\n  {C.YELLOW}[X]{C.RESET} │ Back (save & exit)")
             print()
@@ -742,6 +838,30 @@ class NexusApp:
                 new_val = prompt("New activation command", project.activation_cmd)
                 if new_val:
                     project.activation_cmd = new_val
+
+            elif opt == '+' and len(project.panes_config) < 3:
+                h_size = self.manager.global_config['default_h_split']
+                v_size = self.manager.global_config['default_v_split']
+                print(f"\n  {C.YELLOW}[New Bottom-Left Panel]{C.RESET}")
+                ext_cmd  = prompt("Command to execute (optional)", "")
+                ext_cd   = confirm("Enter project directory?")
+                ext_venv = confirm("Activate virtual environment?")
+                project.panes_config.append(
+                    PaneConfig("Extra", ext_cd, ext_venv, ext_cmd or None)
+                )
+                project.layout_splits.append(
+                    {'direction': 'v', 'percent': v_size, 'target': '0'}
+                )
+                show_success("Panel added")
+                time.sleep(0.5)
+
+            elif opt == '-' and len(project.panes_config) > 2:
+                if confirm(f"Remove last panel '{project.panes_config[-1].name}'?", default=False):
+                    project.panes_config.pop()
+                    project.layout_splits = [s for s in project.layout_splits
+                                             if s['direction'] != 'v']
+                    show_success("Panel removed")
+                    time.sleep(0.5)
 
             elif opt.upper() in [chr(ord('A') + i) for i in range(len(project.panes_config))]:
                 pane_idx = ord(opt.upper()) - ord('A')
@@ -953,8 +1073,8 @@ class NexusApp:
 
         if has_projects:
             print(f"  {C.DIM}Enter project number/alias to launch, or choose an option{C.RESET}")
-
-        return prompt("Select")
+        print()
+        return animated_menu_prompt("Select")
 
     def show_help(self):
         """Display help information."""
