@@ -5,10 +5,12 @@ A cypherpunk-style terminal launcher for tmux projects and system tools.
 """
 
 import os
+import re
 import sys
 import json
 import time
 import select
+import shlex
 import tty
 import termios
 import subprocess
@@ -100,8 +102,23 @@ PRIVATE_DIR = SCRIPT_DIR / "nexus-private"
 
 # Paths for user data
 DATA_FILE = PRIVATE_DIR / "projects.json"
+SNAPSHOTS_FILE = PRIVATE_DIR / "snapshots.json"
 APPS_DIR = PRIVATE_DIR / "apps"
 SCRIPTS_DIR = PRIVATE_DIR / "scripts"
+
+# How many snapshots to preview inline on the main project list
+SNAPSHOT_PREVIEW = 3
+
+# Resume commands per agent. These use the personal zsh aliases:
+#   claudep = CLAUDE_CONFIG_DIR=~/.claude-personal claude --dangerously-skip-permissions
+#   codext  = codex --dangerously-bypass-hook-trust
+RESUME_CMDS = {
+    'claude': "claudep --resume {sid}",
+    'claude-work': "claude --resume {sid}",
+    'codex': "codext resume {sid}",
+}
+
+PERSONAL_CLAUDE_DIR = os.path.expanduser("~/.claude-personal")
 
 
 def init_private_directory():
@@ -424,6 +441,271 @@ class ProjectManager:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SESSION SNAPSHOTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def normalize_path(path):
+    """Normalize a project/pane path for comparison (~, escapes, trailing /)."""
+    if not path:
+        return ""
+    return os.path.normpath(os.path.expanduser(path.replace('\\', '')))
+
+
+class Snapshot:
+    """
+    A saved agent session tied to a project.
+
+    Restoring one relaunches the project's normal tmux layout and additionally
+    resumes the Claude/Codex conversation in the main (largest) pane.
+    """
+    def __init__(self, id, project, tool, session_id, description="",
+                 created_at=None, window_name=None, config_dir=None, batch=None):
+        self.id = id
+        self.project = project
+        self.tool = tool                # 'claude' | 'codex'
+        self.session_id = session_id
+        self.description = description
+        self.created_at = created_at or datetime.now().isoformat(timespec='seconds')
+        self.window_name = window_name
+        self.config_dir = config_dir    # claude only: which install owns the session
+        self.batch = batch              # capture run this snapshot belongs to
+
+    @property
+    def date_label(self):
+        try:
+            return datetime.fromisoformat(self.created_at).strftime("%m-%d")
+        except ValueError:
+            return "??-??"
+
+    @property
+    def stamp(self):
+        try:
+            return datetime.fromisoformat(self.created_at).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return self.created_at
+
+    def resume_cmd(self):
+        """The shell command that reattaches this session."""
+        key = self.tool
+        if self.tool == 'claude' and normalize_path(self.config_dir or "") \
+                and normalize_path(self.config_dir) != normalize_path(PERSONAL_CLAUDE_DIR):
+            key = 'claude-work'
+        template = RESUME_CMDS.get(key)
+        if not template:
+            return None
+        return template.format(sid=self.session_id)
+
+    def to_dict(self):
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**data)
+
+
+class SnapshotManager:
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.snapshots = self._load()
+
+    def _load(self):
+        if not os.path.exists(self.filepath):
+            return []
+        try:
+            with open(self.filepath, 'r') as f:
+                return [Snapshot.from_dict(s) for s in json.load(f)]
+        except (json.JSONDecodeError, IOError, TypeError):
+            return []
+
+    def save(self):
+        with open(self.filepath, 'w') as f:
+            json.dump([s.to_dict() for s in self.snapshots], f, indent=4)
+
+    def next_id(self):
+        return max((s.id for s in self.snapshots), default=0) + 1
+
+    def add(self, snapshot):
+        self.snapshots.append(snapshot)
+        self.save()
+
+    def delete(self, snap_id):
+        before = len(self.snapshots)
+        self.snapshots = [s for s in self.snapshots if s.id != snap_id]
+        if len(self.snapshots) != before:
+            self.save()
+            return True
+        return False
+
+    def get(self, snap_id):
+        for s in self.snapshots:
+            if str(s.id) == str(snap_id):
+                return s
+        return None
+
+    def for_project(self, alias):
+        """All snapshots of a project, newest first."""
+        return sorted((s for s in self.snapshots if s.project == alias),
+                      key=lambda s: s.created_at, reverse=True)
+
+    def batches(self):
+        """Capture batches, newest first: [(batch_stamp, [snapshots...]), ...]"""
+        groups = {}
+        for s in self.snapshots:
+            groups.setdefault(s.batch or s.created_at, []).append(s)
+        return sorted(groups.items(), key=lambda kv: kv[0], reverse=True)
+
+
+class SessionDetector:
+    """
+    Finds live Claude/Codex sessions running inside tmux panes.
+
+    Both agents publish their session id somewhere reliable, so nothing here
+    guesses:
+      - Claude writes  <CLAUDE_CONFIG_DIR>/sessions/<pid>.json  with sessionId
+      - Codex keeps its rollout transcript open as a file descriptor
+    """
+    AGENTS = ('claude', 'codex')
+    ROLLOUT_RE = re.compile(r'rollout-[\dT:-]+-([0-9a-fA-F-]{36})\.jsonl')
+
+    def _process_tree(self):
+        out = subprocess.run(['ps', '-eo', 'pid=,ppid=,comm='],
+                             capture_output=True, text=True).stdout
+        children, comm = {}, {}
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid, ppid = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            children.setdefault(ppid, []).append(pid)
+            comm[pid] = parts[2].strip()
+        return children, comm
+
+    def _find_agent_pid(self, root_pid, children, comm):
+        """Walk down from a pane's shell until an agent process shows up."""
+        stack, seen = [root_pid], set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if comm.get(pid) in self.AGENTS:
+                return pid, comm[pid]
+            stack.extend(children.get(pid, []))
+        return None, None
+
+    def _read_environ(self, pid):
+        try:
+            with open(f'/proc/{pid}/environ', 'rb') as f:
+                raw = f.read().decode('utf-8', 'replace')
+        except OSError:
+            return {}
+        env = {}
+        for item in raw.split('\0'):
+            if '=' in item:
+                k, v = item.split('=', 1)
+                env[k] = v
+        return env
+
+    def _claude_session(self, pid):
+        """Read the session id Claude registered for this pid."""
+        cfg = self._read_environ(pid).get('CLAUDE_CONFIG_DIR') \
+            or os.path.expanduser('~/.claude')
+        registry = Path(cfg) / 'sessions' / f'{pid}.json'
+        try:
+            data = json.loads(registry.read_text())
+            return data.get('sessionId'), cfg
+        except (OSError, json.JSONDecodeError):
+            return None, cfg
+
+    def _codex_session(self, pid):
+        """Pull the session uuid out of the rollout file Codex holds open."""
+        try:
+            fds = os.listdir(f'/proc/{pid}/fd')
+        except OSError:
+            return None
+        for fd in fds:
+            try:
+                target = os.readlink(f'/proc/{pid}/fd/{fd}')
+            except OSError:
+                continue
+            match = self.ROLLOUT_RE.search(target)
+            if match:
+                return match.group(1)
+        return None
+
+    def scan(self):
+        """Return one entry per tmux pane that is running an agent session."""
+        fmt = ("#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}"
+               "\t#{pane_pid}\t#{pane_current_path}")
+        out = subprocess.run(['tmux', 'list-panes', '-a', '-F', fmt],
+                             capture_output=True, text=True)
+        if out.returncode != 0:
+            return []
+
+        children, comm = self._process_tree()
+        found = []
+        for line in out.stdout.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 6:
+                continue
+            sess, win_idx, win_name, pane_idx, pane_pid, path = parts
+            try:
+                agent_pid, tool = self._find_agent_pid(int(pane_pid), children, comm)
+            except ValueError:
+                continue
+            if not agent_pid:
+                continue
+
+            config_dir = None
+            if tool == 'claude':
+                session_id, config_dir = self._claude_session(agent_pid)
+            else:
+                session_id = self._codex_session(agent_pid)
+            if not session_id:
+                continue
+
+            found.append({
+                'target': f"{sess}:{win_idx}.{pane_idx}",
+                'window': win_name,
+                'path': path,
+                'tool': tool,
+                'session_id': session_id,
+                'config_dir': config_dir,
+            })
+        return found
+
+
+def draft_description(pane_target, config_dir=None, lines=150):
+    """Ask Claude to summarize what a pane was doing, for a snapshot label."""
+    cap = subprocess.run(['tmux', 'capture-pane', '-t', pane_target, '-p',
+                          '-S', f'-{lines}'], capture_output=True, text=True)
+    if cap.returncode != 0 or not cap.stdout.strip():
+        return None
+
+    ask = (
+        "Este es el contenido reciente de una terminal donde se trabajaba con "
+        "un agente de IA sobre un proyecto de software. Resume en UNA sola "
+        "linea, en espanol, maximo 110 caracteres, en que se estaba trabajando "
+        "y que quedo pendiente. Responde solo con esa linea, sin comillas ni "
+        "prefijos.\n\n---\n" + cap.stdout
+    )
+
+    env = dict(os.environ)
+    env['CLAUDE_CONFIG_DIR'] = config_dir or PERSONAL_CLAUDE_DIR
+    try:
+        res = subprocess.run(['claude', '-p', '--model', 'haiku', ask],
+                             capture_output=True, text=True, env=env, timeout=180)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout.strip().splitlines()[0].strip() if res.stdout.strip() else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TMUX ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -438,7 +720,7 @@ class TmuxOrchestrator:
         """Build command list for a pane based on its config."""
         cmds = []
         if pane_conf.use_cd:
-            cmds.append(f"cd {project.path}")
+            cmds.append(f"cd {shlex.quote(os.path.expanduser(project.path))}")
         if pane_conf.use_venv:
             cmds.append(project.activation_cmd)
 
@@ -448,45 +730,67 @@ class TmuxOrchestrator:
             cmds.append(pane_conf.custom_cmd)
         return cmds
 
-    def _send_keys(self, pane_index, commands):
+    def _send_keys(self, pane_target, commands):
         for cmd in commands:
-            subprocess.run(['tmux', 'send-keys', '-t', str(pane_index), cmd, 'C-m'],
+            subprocess.run(['tmux', 'send-keys', '-t', str(pane_target), cmd, 'C-m'],
                          capture_output=True)
 
-    def launch_layout(self, project):
+    def _tmux_id(self, args):
+        res = subprocess.run(['tmux'] + args, capture_output=True, text=True)
+        return res.stdout.strip() if res.returncode == 0 else None
+
+    def launch_layout(self, project, resume_cmd=None, new_window=False,
+                      window_name=None):
+        """
+        Build the project's pane layout and run each pane's configured command.
+
+        resume_cmd  extra command for the main (largest) pane, used to reattach
+                    a Claude/Codex session on top of the normal layout.
+        new_window  build in a fresh tmux window instead of the current one, so
+                    several projects can be restored in one go.
+        """
         if not self.check_tmux_session():
             return False
 
         show_info(f"Launching layout for {C.CYAN}{project.alias}{C.RESET}...")
 
+        if new_window:
+            win = self._tmux_id(['new-window', '-P', '-F', '#{window_id}'])
+        else:
+            win = self._tmux_id(['display-message', '-p', '#{window_id}'])
+        if not win:
+            show_error("Could not resolve the target tmux window")
+            return False
+
         # Execute splits
         for split in project.layout_splits:
-            cmd = ['tmux', 'split-window', f"-{split['direction']}", '-p', str(split['percent'])]
-            if split['target']:
-                subprocess.run(['tmux', 'select-pane', '-t', split['target']], capture_output=True)
-            subprocess.run(cmd, capture_output=True)
+            target = split.get('target') or '0'
+            subprocess.run(['tmux', 'split-window', f"-{split['direction']}",
+                            '-p', str(split['percent']), '-t', f"{win}.{target}"],
+                           capture_output=True)
 
-        # Configure each pane
+        # Pane index -> panes_config index.
+        # 3-pane layout: pane 0 = main (the big one, top-left), pane 1 = the
+        # short bottom-left strip, pane 2 = the tall right column where the
+        # server runs. 2-pane layout maps straight through.
         n = len(project.panes_config)
-        if n == 2:
-            # Simple horizontal split: pane 0 = left, pane 1 = right
-            self._send_keys(0, self._build_cmds(project, project.panes_config[0]))
-            self._send_keys(1, self._build_cmds(project, project.panes_config[1]))
-        else:
-            # 3-pane layout: pane 0 = top-left, pane 1 = extra (right), pane 2 = server (bottom-left)
-            if n > 0:
-                self._send_keys(0, self._build_cmds(project, project.panes_config[0]))
-            if n > 2:
-                self._send_keys(1, self._build_cmds(project, project.panes_config[2]))
-            if n > 1:
-                self._send_keys(2, self._build_cmds(project, project.panes_config[1]))
+        mapping = [(0, 0), (1, 1)] if n == 2 else [(0, 0), (1, 2), (2, 1)]
 
-        # Rename window and set focus
-        subprocess.run(['tmux', 'rename-window', project.alias], capture_output=True)
-        subprocess.run(['tmux', 'select-pane', '-t', '0'], capture_output=True)
+        for pane_idx, conf_idx in mapping:
+            if conf_idx >= n:
+                continue
+            cmds = self._build_cmds(project, project.panes_config[conf_idx])
+            if pane_idx == 0 and resume_cmd:
+                cmds.append(resume_cmd)
+            self._send_keys(f"{win}.{pane_idx}", cmds)
+
+        # Rename window and set focus on the main pane
+        subprocess.run(['tmux', 'rename-window', '-t', win,
+                        window_name or project.alias], capture_output=True)
+        subprocess.run(['tmux', 'select-pane', '-t', f"{win}.0"], capture_output=True)
 
         show_success(f"Project '{project.alias}' loaded successfully")
-        return True
+        return win
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -652,6 +956,8 @@ class SystemScriptsManager:
 class NexusApp:
     def __init__(self):
         self.manager = ProjectManager(DATA_FILE)
+        self.snapshots = SnapshotManager(SNAPSHOTS_FILE)
+        self.detector = SessionDetector()
         self.tmux = TmuxOrchestrator()
         self.programs = ExternalProgramsManager()
         self.scripts = SystemScriptsManager()
@@ -894,8 +1200,8 @@ class NexusApp:
         show_success(f"Pane '{pane.name}' updated")
         time.sleep(0.5)
 
-    def _display_projects_list(self):
-        """Display formatted project list."""
+    def _display_projects_list(self, with_snapshots=False):
+        """Display formatted project list, optionally with snapshot previews."""
         if not self.manager.projects:
             print(f"\n  {C.DIM}No projects configured{C.RESET}")
             return False
@@ -904,8 +1210,273 @@ class NexusApp:
         for i, p in enumerate(self.manager.projects, 1):
             path_display = p.path if len(p.path) < 40 else '...' + p.path[-37:]
             print(f"  {C.CYAN}{i:>2}{C.RESET} │ {C.BOLD}{p.alias:<15}{C.RESET} {C.DIM}{path_display}{C.RESET}")
+
+            if not with_snapshots:
+                continue
+
+            snaps = self.snapshots.for_project(p.alias)
+            if not snaps:
+                continue
+
+            chips = "  ".join(
+                f"{C.MAGENTA}#{s.id}{C.RESET}{C.DIM}·{s.date_label}{C.RESET}"
+                for s in snaps[:SNAPSHOT_PREVIEW]
+            )
+            more = ""
+            if len(snaps) > SNAPSHOT_PREVIEW:
+                more = f"  {C.DIM}(+{len(snaps) - SNAPSHOT_PREVIEW}){C.RESET}"
+            print(f"       {C.BRIGHT_BLACK}⌁{C.RESET} {C.DIM}s{i}{C.RESET} {chips}{more}")
         print()
         return True
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SNAPSHOTS UI
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _tool_tag(self, tool):
+        color = C.BRIGHT_MAGENTA if tool == 'claude' else C.BRIGHT_GREEN
+        return f"{color}{tool:<6}{C.RESET}"
+
+    def restore_snapshot(self, snapshot, new_window=False):
+        """Relaunch a project's layout and resume its agent session."""
+        project = self.manager.get_project(snapshot.project)
+        if not project:
+            show_error(f"Project '{snapshot.project}' no longer exists")
+            return False
+
+        resume = snapshot.resume_cmd()
+        if not resume:
+            show_error(f"Unknown tool '{snapshot.tool}' — cannot build resume command")
+            return False
+
+        show_info(f"Resuming {self._tool_tag(snapshot.tool)}{C.DIM}{snapshot.session_id}{C.RESET}")
+        return self.tmux.launch_layout(project, resume_cmd=resume,
+                                       new_window=new_window,
+                                       window_name=snapshot.window_name)
+
+    def project_snapshots_menu(self, project):
+        """Full snapshot history for one project, with restore/delete."""
+        while True:
+            clear_screen()
+            print(NEXUS_LOGO)
+            print_header(f"SNAPSHOTS: {project.alias}")
+
+            snaps = self.snapshots.for_project(project.alias)
+            if not snaps:
+                print(f"\n  {C.DIM}No snapshots saved for this project{C.RESET}")
+                print(f"  {C.DIM}Use [K] on the main menu to capture live sessions{C.RESET}\n")
+            else:
+                print()
+                for s in snaps:
+                    desc = s.description or f"{C.DIM}(no description){C.RESET}"
+                    print(f"  {C.MAGENTA}{s.id:>3}{C.RESET} │ {self._tool_tag(s.tool)} │ "
+                          f"{C.DIM}{s.stamp}{C.RESET}")
+                    print(f"      {C.BRIGHT_BLACK}└{C.RESET} {desc}")
+                print()
+
+            print_divider()
+            print(f"  {C.YELLOW}[#]{C.RESET} Restore snapshot   "
+                  f"{C.YELLOW}[D]{C.RESET} Delete   {C.YELLOW}[B]{C.RESET} Back")
+            print_divider()
+
+            choice = prompt("Select snapshot or option")
+            if not choice or choice.lower() == 'b':
+                return False
+
+            if choice.lower() == 'd':
+                target = prompt("Snapshot number to delete")
+                snap = self.snapshots.get(target)
+                if not snap or snap.project != project.alias:
+                    show_error("Snapshot not found")
+                    time.sleep(1)
+                elif confirm(f"Delete snapshot #{snap.id}?", default=False):
+                    self.snapshots.delete(snap.id)
+                    show_success("Snapshot deleted")
+                    time.sleep(0.6)
+                continue
+
+            snap = self.snapshots.get(choice)
+            if not snap or snap.project != project.alias:
+                show_error("Snapshot not found")
+                time.sleep(1)
+                continue
+
+            if self.restore_snapshot(snap):
+                return True
+
+    def snapshots_menu(self):
+        """Cross-project snapshot browser, grouped by capture batch."""
+        while True:
+            clear_screen()
+            print(NEXUS_LOGO)
+            print_header("SESSION SNAPSHOTS")
+
+            batches = self.snapshots.batches()
+            if not batches:
+                print(f"\n  {C.DIM}No snapshots saved yet{C.RESET}")
+                print(f"  {C.DIM}Use [K] to capture the sessions running right now{C.RESET}\n")
+            else:
+                for stamp, snaps in batches:
+                    label = snaps[0].stamp if snaps else stamp
+                    print(f"\n  {C.CYAN}▪ {label}{C.RESET} {C.DIM}({len(snaps)} window"
+                          f"{'s' if len(snaps) != 1 else ''}){C.RESET}")
+                    for s in sorted(snaps, key=lambda x: x.id):
+                        desc = s.description or f"{C.DIM}(no description){C.RESET}"
+                        print(f"    {C.MAGENTA}{s.id:>3}{C.RESET} │ {self._tool_tag(s.tool)} │ "
+                              f"{C.BOLD}{s.project:<13}{C.RESET} {desc[:55]}")
+                print()
+
+            print_divider()
+            print(f"  {C.YELLOW}[#]{C.RESET} Restore one   {C.YELLOW}[A]{C.RESET} Restore a whole batch   "
+                  f"{C.YELLOW}[B]{C.RESET} Back")
+            print_divider()
+
+            choice = prompt("Select snapshot or option")
+            if not choice or choice.lower() == 'b':
+                return False
+
+            if choice.lower() == 'a':
+                if self._restore_batch_ui(batches):
+                    return True
+                continue
+
+            snap = self.snapshots.get(choice)
+            if not snap:
+                show_error("Snapshot not found")
+                time.sleep(1)
+                continue
+
+            if self.restore_snapshot(snap):
+                return True
+
+    def _restore_batch_ui(self, batches):
+        """Rebuild every window of one capture batch, each in its own window."""
+        if not batches:
+            return False
+
+        print()
+        for i, (stamp, snaps) in enumerate(batches, 1):
+            label = snaps[0].stamp if snaps else stamp
+            names = ", ".join(sorted({s.project for s in snaps}))
+            print(f"  {C.CYAN}{i:>2}{C.RESET} │ {label} {C.DIM}({len(snaps)}): {names}{C.RESET}")
+        print()
+
+        choice = prompt("Batch number to restore")
+        if not choice.isdigit() or not (1 <= int(choice) <= len(batches)):
+            show_error("Invalid batch")
+            time.sleep(1)
+            return False
+
+        snaps = sorted(batches[int(choice) - 1][1], key=lambda s: s.id)
+        if not confirm(f"Open {len(snaps)} tmux windows?", default=True):
+            return False
+
+        first_window = None
+        restored = 0
+        for snap in snaps:
+            win = self.restore_snapshot(snap, new_window=True)
+            if win:
+                restored += 1
+                first_window = first_window or win
+
+        if not restored:
+            show_error("Nothing could be restored")
+            time.sleep(1.5)
+            return False
+
+        if first_window:
+            subprocess.run(['tmux', 'select-window', '-t', first_window],
+                           capture_output=True)
+        show_success(f"{restored} window(s) restored")
+        time.sleep(1)
+        return True
+
+    def capture_snapshots_ui(self):
+        """Scan tmux for live agent sessions and save them as snapshots."""
+        clear_screen()
+        print(NEXUS_LOGO)
+        print_header("CAPTURE SESSIONS")
+
+        show_info("Scanning tmux panes for Claude/Codex sessions...")
+        found = self.detector.scan()
+
+        if not found:
+            show_warning("No live Claude or Codex sessions found in tmux")
+            return
+
+        # Match each session to a configured project by path
+        by_path = {normalize_path(p.path): p for p in self.manager.projects}
+        for item in found:
+            item['project'] = by_path.get(normalize_path(item['path']))
+
+        print()
+        for i, item in enumerate(found, 1):
+            proj = item['project'].alias if item['project'] else f"{C.RED}unmatched{C.RESET}"
+            print(f"  {C.CYAN}{i:>2}{C.RESET} │ {self._tool_tag(item['tool'])} │ "
+                  f"{C.BOLD}{item['window']:<18}{C.RESET} {proj:<14} "
+                  f"{C.DIM}{item['session_id'][:8]}…{C.RESET}")
+        print()
+
+        unmatched = [i for i in found if not i['project']]
+        if unmatched:
+            show_warning(f"{len(unmatched)} session(s) have no matching project "
+                         f"and will be skipped")
+
+        print_divider()
+        print(f"  {C.YELLOW}[A]{C.RESET} Capture all   {C.YELLOW}[#]{C.RESET} Capture one   "
+              f"{C.YELLOW}[B]{C.RESET} Back")
+        print_divider()
+
+        choice = prompt("Select")
+        if not choice or choice.lower() == 'b':
+            return
+
+        if choice.lower() == 'a':
+            targets = [i for i in found if i['project']]
+        elif choice.isdigit() and 1 <= int(choice) <= len(found):
+            item = found[int(choice) - 1]
+            if not item['project']:
+                show_error("That session has no matching project")
+                return
+            targets = [item]
+        else:
+            show_error("Invalid selection")
+            return
+
+        batch = datetime.now().isoformat(timespec='seconds')
+        saved = 0
+        for item in targets:
+            print()
+            print_divider()
+            print(f"  {C.BOLD}{item['window']}{C.RESET} "
+                  f"{C.DIM}({item['project'].alias}, {item['tool']}){C.RESET}")
+            print(f"  {C.DIM}Leave empty to have Claude write it for you{C.RESET}")
+
+            desc = prompt("Description")
+            if not desc:
+                show_info("Asking Claude to summarize the pane...")
+                desc = draft_description(item['target'], item['config_dir'])
+                if desc:
+                    print(f"  {C.GREEN}→{C.RESET} {desc}")
+                    if not confirm("Keep this description?", default=True):
+                        desc = prompt("Description") or desc
+                else:
+                    show_warning("Could not generate a description")
+                    desc = ""
+
+            self.snapshots.add(Snapshot(
+                id=self.snapshots.next_id(),
+                project=item['project'].alias,
+                tool=item['tool'],
+                session_id=item['session_id'],
+                description=desc,
+                window_name=item['window'],
+                config_dir=item['config_dir'],
+                batch=batch,
+            ))
+            saved += 1
+
+        show_success(f"{saved} snapshot(s) saved")
 
     # ─────────────────────────────────────────────────────────────────────────
     # EXTERNAL PROGRAMS UI
@@ -1052,12 +1623,12 @@ class NexusApp:
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         tmux_status = f"{C.GREEN}ACTIVE{C.RESET}" if os.environ.get('TMUX') else f"{C.RED}INACTIVE{C.RESET}"
         print(f"  {C.BRIGHT_BLACK}┌─────────────────────────────────────────────────────────┐{C.RESET}")
-        print(f"  {C.BRIGHT_BLACK}│{C.RESET}  {C.DIM}TMUX:{C.RESET} {tmux_status}  {C.DIM}│{C.RESET}  {C.DIM}Projects:{C.RESET} {C.CYAN}{len(self.manager.projects)}{C.RESET}  {C.DIM}│{C.RESET}  {C.DIM}{now}{C.RESET}  {C.BRIGHT_BLACK}│{C.RESET}")
+        print(f"  {C.BRIGHT_BLACK}│{C.RESET}  {C.DIM}TMUX:{C.RESET} {tmux_status}  {C.DIM}│{C.RESET}  {C.DIM}Projects:{C.RESET} {C.CYAN}{len(self.manager.projects)}{C.RESET}  {C.DIM}│{C.RESET}  {C.DIM}Snaps:{C.RESET} {C.MAGENTA}{len(self.snapshots.snapshots)}{C.RESET}  {C.DIM}│{C.RESET}  {C.DIM}{now}{C.RESET}  {C.BRIGHT_BLACK}│{C.RESET}")
         print(f"  {C.BRIGHT_BLACK}└─────────────────────────────────────────────────────────┘{C.RESET}")
 
         # Quick access projects
         print_header("PROJECTS")
-        has_projects = self._display_projects_list()
+        has_projects = self._display_projects_list(with_snapshots=True)
 
         # Menu options
         print_divider('═')
@@ -1067,12 +1638,17 @@ class NexusApp:
   {C.YELLOW}[N]{C.RESET} New project                 {C.YELLOW}[P]{C.RESET} External programs
   {C.YELLOW}[E]{C.RESET} Edit project                {C.YELLOW}[S]{C.RESET} System scripts
   {C.YELLOW}[C]{C.RESET} Configuration               {C.YELLOW}[H]{C.RESET} Help
-  {C.YELLOW}[Q]{C.RESET} Quit
+
+  {C.CYAN}Snapshots{C.RESET}                        {C.YELLOW}[Q]{C.RESET} Quit
+  {C.BRIGHT_BLACK}──────────{C.RESET}
+  {C.YELLOW}[K]{C.RESET} Capture live sessions
+  {C.YELLOW}[R]{C.RESET} Restore / browse all
 """)
         print_divider('═')
 
         if has_projects:
-            print(f"  {C.DIM}Enter project number/alias to launch, or choose an option{C.RESET}")
+            print(f"  {C.DIM}Enter project number/alias to launch  ·  "
+                  f"{C.RESET}{C.MAGENTA}s<n>{C.RESET}{C.DIM} for that project's snapshots{C.RESET}")
         print()
         return animated_menu_prompt("Select")
 
@@ -1100,6 +1676,24 @@ class NexusApp:
   {C.YELLOW}SYSTEM SCRIPTS{C.RESET}  {C.DIM}(scripts/ directory){C.RESET}
     Execute shell scripts for system configuration.
     Supports .sh and .py files.
+
+  {C.YELLOW}SESSION SNAPSHOTS{C.RESET}
+    Save what you were doing so a reboot doesn't lose it.
+
+    {C.CYAN}[K]{C.RESET} scans every tmux pane for live Claude/Codex
+    sessions, matches each one to its project by path, and
+    stores its session id plus a description — typed by you,
+    or drafted by Claude from the pane's own scrollback.
+
+    Each project's most recent snapshots show under it on the
+    main list; type {C.MAGENTA}s<number>{C.RESET} to see that project's full
+    history, or {C.CYAN}[R]{C.RESET} to browse every snapshot at once.
+
+    Restoring builds the project's usual panel layout and
+    additionally resumes the conversation in the main panel
+    ({C.DIM}claudep --resume{C.RESET} / {C.DIM}codext resume{C.RESET}). From {C.CYAN}[R]{C.RESET} you can
+    restore a whole capture batch, one tmux window each, to
+    get your workspace back the way you left it.
 
   {C.YELLOW}KEYBOARD SHORTCUTS{C.RESET}
     Most menus accept both numbers and letters.
@@ -1154,6 +1748,26 @@ class NexusApp:
 
                 elif choice_lower == 'h':
                     self.show_help()
+
+                elif choice_lower == 'k':
+                    self.capture_snapshots_ui()
+                    input(f"\n  {C.DIM}Press ENTER to continue...{C.RESET}")
+
+                elif choice_lower == 'r':
+                    if self.snapshots_menu():
+                        break  # a snapshot was restored
+
+                elif (choice_lower.startswith('s') and choice_lower[1:].strip()
+                        and not self.manager.get_project(choice)):
+                    # s<n> / s<alias> → that project's snapshot history.
+                    # Guarded so aliases like 'safety' or 'swd' still launch.
+                    project = self.manager.get_project(choice[1:].strip())
+                    if project:
+                        if self.project_snapshots_menu(project):
+                            break  # a snapshot was restored
+                    else:
+                        show_error(f"Project '{choice[1:].strip()}' not found")
+                        time.sleep(1)
 
                 elif self.manager.projects:
                     # Try to launch a project
