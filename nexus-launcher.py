@@ -300,20 +300,8 @@ def animated_menu_prompt(prompt_text):
                     sys.stdout.write(ch)
                     sys.stdout.flush()
 
-            # Animated status with color cycling
-            sp_main = _spinner_main[frame % len(_spinner_main)]
-            sp_side_l = _spinner_side[frame % len(_spinner_side)]
-            sp_side_r = _spinner_side[-(frame % len(_spinner_side))-1]
-
-            status_idx = (frame // 3) % len(_statuses)
-            status_text, status_color = _statuses[status_idx]
-
-            # Glitch effect occasionally
-            if frame % 12 == 0:
-                status_text = status_text.replace(' ', '█')
-
-            sys.stdout.write(f"\033[s\033[A\r  {sp_side_l}{C.RESET} {status_color}{sp_main} {status_text}{C.RESET} {sp_side_r}\033[u")
-            sys.stdout.flush()
+            # Animated status disabled for macOS compatibility
+            # (was causing cursor to drift upward)
             frame += 1
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -469,6 +457,7 @@ class TmuxOrchestrator:
     def check_tmux_session(self):
         if not os.environ.get('TMUX'):
             show_error("Este script debe ejecutarse DENTRO de una sesion de tmux")
+            input(f"\n  {C.DIM}Press ENTER to continue...{C.RESET}")
             return False
         return True
 
