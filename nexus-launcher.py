@@ -333,11 +333,13 @@ class Project:
     Project configuration including layout and pane settings.
     """
     def __init__(self, alias, path, venv_path, activation_cmd=None,
-                 layout_splits=None, panes_config=None):
+                 layout_splits=None, panes_config=None, aliases=None):
         self.alias = alias
         self.path = path
         self.venv_path = venv_path
         self.activation_cmd = activation_cmd if activation_cmd else f"source {os.path.join(venv_path, 'bin', 'activate')}"
+        # Nicknames for this project; also used by reco to link tasks to it.
+        self.aliases = list(aliases) if aliases else []
 
         if layout_splits is None:
             self.layout_splits = [
@@ -410,8 +412,12 @@ class ProjectManager:
             idx = int(identifier) - 1
             if 0 <= idx < len(self.projects):
                 return self.projects[idx]
+        wanted = str(identifier).lower()
         for p in self.projects:
-            if p.alias.lower() == str(identifier).lower():
+            if p.alias.lower() == wanted:
+                return p
+        for p in self.projects:
+            if wanted in [a.lower() for a in p.aliases]:
                 return p
         return None
 
@@ -447,6 +453,36 @@ def git_dirty_map(projects):
         return {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         return dict(pool.map(_probe_dirty, projects))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RECO TASKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+RECO_TASKS_PATH = Path.home() / '.codex' / 'reminders-chirho' / 'tasks.json'
+RECO_CLOSED_STATUSES = {'done', 'cancelled'}
+
+
+def open_task_counts(projects):
+    """Open reco tasks per project alias, linked through project_ref_chirho."""
+    try:
+        with open(RECO_TASKS_PATH) as f:
+            tasks = json.load(f).get('tasks_chirho', [])
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+    known = {p.alias.lower(): p.alias for p in projects}
+    counts = {}
+    for task in tasks:
+        if task.get('status_chirho') in RECO_CLOSED_STATUSES:
+            continue
+        ref = task.get('project_ref_chirho') or ''
+        if not ref:
+            # Tasks predating the link: their project string may carry a personal/ prefix.
+            ref = str(task.get('project_chirho') or '').split('/')[-1]
+        alias = known.get(str(ref).lower())
+        if alias:
+            counts[alias] = counts.get(alias, 0) + 1
+    return counts
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -937,17 +973,25 @@ class NexusApp:
             return False
 
         dirty = git_dirty_map(self.manager.projects) if show_git else {}
+        tasks = open_task_counts(self.manager.projects)
 
         print()
         for i, p in enumerate(self.manager.projects, 1):
             path_display = p.path if len(p.path) < 40 else '...' + p.path[-37:]
             mark = f"{C.YELLOW}●{C.RESET}" if dirty.get(p.alias) else " "
-            print(f"  {C.CYAN}{i:>2}{C.RESET} │ {mark} {C.BOLD}{p.alias:<15}{C.RESET} {C.DIM}{path_display}{C.RESET}")
+            count = tasks.get(p.alias)
+            badge = f"{C.CYAN}{count:>2}{C.RESET}" if count else "  "
+            print(f"  {C.CYAN}{i:>2}{C.RESET} │ {mark} {badge} {C.BOLD}{p.alias:<15}{C.RESET} {C.DIM}{path_display}{C.RESET}")
         print()
 
-        pending = sum(1 for v in dirty.values() if v)
-        if pending:
-            print(f"  {C.YELLOW}●{C.RESET} {C.DIM}{pending} with uncommitted changes{C.RESET}\n")
+        dirty_count = sum(1 for v in dirty.values() if v)
+        open_tasks = sum(tasks.values())
+        if dirty_count:
+            print(f"  {C.YELLOW}●{C.RESET} {C.DIM}{dirty_count} with uncommitted changes{C.RESET}")
+        if open_tasks:
+            print(f"  {C.CYAN}##{C.RESET} {C.DIM}{open_tasks} open reco tasks{C.RESET}")
+        if dirty_count or open_tasks:
+            print()
         return True
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1138,6 +1182,9 @@ class NexusApp:
 
     A {C.YELLOW}●{C.RESET} next to a project means its git repo has
     uncommitted or untracked changes — work left midway.
+
+    The {C.CYAN}number{C.RESET} after it counts that project's open reco
+    tasks ({C.DIM}codex-reminder-chirho list --project <alias>{C.RESET}).
 
     To pick up an agent conversation, launch the project
     and run {C.DIM}claude --resume{C.RESET} or {C.DIM}codex resume{C.RESET} inside it:
