@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -278,13 +281,61 @@ def abrir_dashboard():
     return {"salida": _run(["open"], timeout=60) or "dashboard abierto"}
 
 
+def _remote_config():
+    """(url, token) del servidor de reco, o None si se fuerza lo local (RECO_LOCAL=1).
+    Misma fuente que el CLI: entorno o ~/.codex/reminders-chirho/remote.env."""
+    if os.environ.get("RECO_LOCAL") == "1":
+        return None
+    cfg = {"RECO_URL": os.environ.get("RECO_URL", "").strip(), "RECO_TOKEN": os.environ.get("RECO_TOKEN", "").strip()}
+    env_file = TASKS_PATH.parent / "remote.env"
+    if env_file.is_file():
+        for line in env_file.read_text().splitlines():
+            key, sep, value = line.partition("=")
+            key = key.strip()
+            if sep and key in cfg and not cfg[key]:
+                cfg[key] = value.strip().strip("'\"")
+    return (cfg["RECO_URL"].rstrip("/"), cfg["RECO_TOKEN"]) if cfg["RECO_URL"] and cfg["RECO_TOKEN"] else None
+
+
+def _remote_tool(cfg, name: str, args: dict) -> dict:
+    req = urllib.request.Request(
+        f"{cfg[0]}/api/reco/tools/{name}/", data=json.dumps(args).encode(), method="POST",
+        headers={"Authorization": f"Bearer {cfg[1]}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.load(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.load(e)
+        except ValueError:
+            raise RecoError(f"El servidor de reco respondió HTTP {e.code}.") from e
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise RecoError(f"No pude conectar con el servidor de reco: {e}") from e
+    if not body.get("ok"):
+        raise RecoError(body.get("error", {}).get("message", "Error del servidor de reco."))
+    return body["result"]
+
+
 def editar_tarea(id=None, titulo=None, detalles=None, repo=None):
-    """Edita título/detalles/proyecto. La CLI de reco no expone esto, así que
-    se escribe directo en tasks.json. No sincroniza con Habitica."""
+    """Edita título/detalles/proyecto. En modo remoto (lo normal) usa las tools del
+    servidor; solo con RECO_LOCAL=1 escribe directo en tasks.json (sin Habitica)."""
     if not id:
         raise RecoError("Falta el id de la tarea.")
     if titulo is None and detalles is None and repo is None:
         raise RecoError("Nada que editar: pasá titulo, detalles y/o repo.")
+
+    cfg = _remote_config()
+    if cfg:
+        tarea = None
+        if titulo is not None:
+            tarea = _remote_tool(cfg, "rename_task", {"id": id, "title": titulo})["task"]
+        if detalles is not None:
+            tarea = _remote_tool(cfg, "set_details", {"id": id, "text": detalles})["task"]
+        if repo is not None:
+            tarea = _remote_tool(cfg, "set_project", {"id": id, "project": repo})["task"]
+        _run(["projects"])  # cualquier comando remoto refresca el espejo local de tasks.json
+        return {"tarea": tarea, "proyecto": None}
+
     if not TASKS_PATH.is_file():
         raise RecoError(f"No existe el store de tareas: {TASKS_PATH}")
 
