@@ -36,6 +36,13 @@ python3 reco_chat.py
 Las herramientas que **solo leen** (listar, ver vencidas, estadísticas) se ejecutan
 solas. Las que **escriben** piden confirmación; `/auto` desactiva ese pedido.
 
+### Bases de datos (Tabulia)
+
+Al arrancar, el chat le pide al servidor de reco su catálogo y suma las tools `db_*` (las bases de datos de
+Tabulia: consultar, guardar, avisos, cambios de estructura). No hay copia local: si el servidor agrega o cambia
+una, aparece sola. Las que solo leen se ejecutan sin confirmar (vienen marcadas en el catálogo MCP). La guía del
+lenguaje de consultas también llega del servidor y entra en el prompt de sistema.
+
 ### Comandos del chat
 
 | Comando | Qué hace |

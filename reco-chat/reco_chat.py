@@ -174,7 +174,8 @@ def system_prompt() -> str:
     repos = rb.listar_repos()
     return (
         "Sos un asistente que administra las tareas y recordatorios de Nelson en 'reco' "
-        "(codex-reminder-chirho), desde la terminal.\n\n"
+        "(codex-reminder-chirho), desde la terminal, y también sus bases de datos de Tabulia "
+        "(herramientas db_*).\n\n"
         f"Hoy es {hoy.strftime('%Y-%m-%d')} ({hoy.strftime('%A')}).\n\n"
         "Reglas:\n"
         "- Respondé siempre en español, breve y directo. Nada de relleno.\n"
@@ -190,6 +191,7 @@ def system_prompt() -> str:
         "- Después de ejecutar algo, confirmá en una línea qué pasó (incluyendo el id de la tarea).\n\n"
         f"Repos personales: {', '.join(repos['personales'])}\n"
         f"Repos de trabajo: {', '.join(repos['trabajo'])}\n"
+        + (f"\n{rb.REMOTE_GUIDE}\n" if rb.REMOTE_GUIDE else "")
     )
 
 
@@ -309,6 +311,10 @@ def main() -> int:
         print(f"  {C.DIM}tareas abiertas:{C.RESET} {n}")
     except rb.RecoError as e:
         print(f"  {C.YELLOW}⚠ no pude leer las tareas: {e}{C.RESET}")
+
+    n_db = rb.cargar_tools_remotas()
+    if n_db:
+        print(f"  {C.DIM}bases de datos (Tabulia):{C.RESET} {n_db} herramientas")
 
     print(f"  {C.DIM}/ayuda para los comandos · Ctrl+D para salir{C.RESET}\n")
 

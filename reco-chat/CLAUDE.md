@@ -21,3 +21,28 @@ y refresca `~/.codex/reminders-chirho/tasks.json` como **espejo de solo lectura*
 - Comandos que siguen siendo locales (leen la laptop): `sync-sessions`, `pulse`, `stats`, `serve`, `check`, `render`, `open`, `habitica-sync`. Habitica ya lo sincroniza el servidor.
 - Para título de una tarea no hay comando del CLI: usá la tool `rename_task` por HTTP (`POST {RECO_URL}/api/reco/tools/rename_task/`) o `editar_tarea` de `reco_backend.py`.
 - Runbook del servidor: `~/PycharmProjects/SWDprod/docs-ia/infra/reco-vps.md`.
+
+## Bases de datos de Nelson (Tabulia) — tools `db_*`
+
+Además de las tareas, desde acá se administran las bases de datos de Tabulia (app `tabulia` de SWDprod): consultar,
+guardar, cambiar, archivar, pedir cambios de estructura al arquitecto y crear **avisos** («avísame cuando…»,
+«cada lunes mándame…», que llegan por Telegram vía Rocko). Son tools del MISMO servidor de reco, por HTTP:
+
+```bash
+set -a; . ~/.codex/reminders-chirho/remote.env; set +a      # RECO_URL + RECO_TOKEN
+# guía (lenguaje de consultas, avisos, reglas): la sección "## Bases de datos" del final
+curl -s "$RECO_URL/api/reco/guide/" -H "Authorization: Bearer $RECO_TOKEN" | sed -n '/^## Bases de datos/,$p'
+# llamar una tool (los argumentos estructurados van como JSON en texto: query_json, records_json, set_json…)
+curl -s -X POST "$RECO_URL/api/reco/tools/db_list/" -H "Authorization: Bearer $RECO_TOKEN" \
+     -H 'Content-Type: application/json' -d '{}'
+curl -s -X POST "$RECO_URL/api/reco/tools/db_query/" -H "Authorization: Bearer $RECO_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"base": "gastos", "query_json": "{\"from\": \"gastos\", \"group\": [\"categoria\"], \"agg\": {\"t\": [\"sum\", \"monto\"]}}"}'
+```
+
+- Catálogo completo con esquemas: `GET $RECO_URL/api/reco/tools/?format=mcp` (las `db_*`; `readOnlyHint` = solo lee).
+- Reglas: mirá `db_describe` antes de guardar o consultar (no inventes tablas ni columnas); archivar varios registros pide
+  `confirm=true` después de preguntarle a Nelson; los cambios de estructura van por `db_structure` (asíncrono, el
+  arquitecto avisa por Telegram) y se aplican SOLO cuando Nelson lo pide (`db_apply_plan`). Nada se borra: se archiva.
+- El chat de terminal (`reco_chat.py`) ya carga solas estas tools al arrancar (`cargar_tools_remotas`).
+- Alternativa: el servidor MCP de reco (`$RECO_URL/api/reco/mcp/`, mismo token) expone las mismas tools.

@@ -461,8 +461,64 @@ TOOLS_SPEC = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Tools remotas: las bases de datos de Tabulia (db_*)
+# ---------------------------------------------------------------------------
+#
+# No se copian acá: se descubren del servidor de reco al arrancar (catálogo MCP, que trae cuáles
+# solo leen) y se ejecutan con la misma llamada HTTP que rename_task. Si el servidor agrega o
+# cambia una tool db_*, reco-chat la ve sin tocar este archivo.
+
+REMOTE_TOOLS: set[str] = set()
+REMOTE_GUIDE = ""
+
+
+def _remote_get(cfg, path: str):
+    req = urllib.request.Request(f"{cfg[0]}{path}", headers={"Authorization": f"Bearer {cfg[1]}"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode()
+
+
+def cargar_tools_remotas(prefijo: str = "db_") -> int:
+    """Suma a TOOLS_SPEC las tools del servidor que empiezan con `prefijo`. → cuántas cargó."""
+    global REMOTE_GUIDE
+    cfg = _remote_config()
+    if not cfg:
+        return 0
+    try:
+        catalogo = json.loads(_remote_get(cfg, "/api/reco/tools/?format=mcp")).get("tools", [])
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return 0
+    n = 0
+    for t in catalogo:
+        nombre = t.get("name", "")
+        if not nombre.startswith(prefijo) or nombre in TOOL_FUNCS or nombre in REMOTE_TOOLS:
+            continue
+        schema = t.get("inputSchema") or {}
+        TOOLS_SPEC.append(_tool(nombre, t.get("description", ""), schema.get("properties"), schema.get("required")))
+        REMOTE_TOOLS.add(nombre)
+        if (t.get("annotations") or {}).get("readOnlyHint"):
+            READ_ONLY.add(nombre)
+        n += 1
+    try:
+        guia = _remote_get(cfg, "/api/reco/guide/")
+        inicio = guia.find("## Bases de datos")
+        REMOTE_GUIDE = guia[inicio:].strip() if inicio >= 0 else ""
+    except (urllib.error.URLError, TimeoutError):
+        REMOTE_GUIDE = ""
+    return n
+
+
 def ejecutar_tool(nombre: str, argumentos: dict) -> dict:
     """Ejecuta una tool por nombre. Devuelve {'ok': ...} o {'error': ...}."""
+    if nombre in REMOTE_TOOLS:
+        cfg = _remote_config()
+        if not cfg:
+            return {"error": "No hay conexión configurada con el servidor de reco (remote.env)."}
+        try:
+            return {"ok": _remote_tool(cfg, nombre, argumentos or {})}
+        except RecoError as e:
+            return {"error": str(e)}
     fn = TOOL_FUNCS.get(nombre)
     if fn is None:
         return {"error": f"No existe la herramienta '{nombre}'."}
