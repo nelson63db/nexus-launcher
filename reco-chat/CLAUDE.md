@@ -46,3 +46,18 @@ curl -s -X POST "$RECO_URL/api/reco/tools/db_query/" -H "Authorization: Bearer $
   arquitecto avisa por Telegram) y se aplican SOLO cuando Nelson lo pide (`db_apply_plan`). Nada se borra: se archiva.
 - El chat de terminal (`reco_chat.py`) ya carga solas estas tools al arrancar (`cargar_tools_remotas`).
 - Alternativa: el servidor MCP de reco (`$RECO_URL/api/reco/mcp/`, mismo token) expone las mismas tools.
+
+## Rocko con Claude (`rocko_claude_worker.py`)
+
+El panel «Chat» del launcher arranca `rocko_claude_worker.py --background`: mientras el proyecto reco está
+abierto, el bot de Telegram contesta con `claude -p` (Sonnet, esfuerzo bajo, cuenta personal
+`~/.claude-personal`) en vez de Gemini. Ver README § «Rocko con Claude».
+
+- **Nunca** apuntarlo a `~/.claude` (instalación de trabajo) ni pasarle una `ANTHROPIC_API_KEY`.
+- El mismo worker atiende la cola de **EasyDoc** (`/api/v1/easydoc/claude/laptop/…`, SWDprod `api_apps/easydoc/claude_queue.py`):
+  Sonnet con esfuerzo alto, sin tools, texto por trozos. Un hilo por trabajo; la pregunta de Rocko sigue siendo el latido.
+  Si se cambia el protocolo acá, cambiarlo allá (y en `api_apps/easydoc/test_claude.py`). Para parar el worker usa
+  `--stop`; **nunca** `pkill`/`kill` por patrón.
+- Diagnóstico: `python3 rocko_claude_worker.py --status` y `~/.cache/rocko-claude/worker.log`.
+- El protocolo (claim/done/fail, lease, `X-Rocko-Job`) lo define el servidor: SWDprod `reco/rocko_queue.py`.
+  Si se cambia acá, cambiarlo allá (y sus tests en `reco/tests_rocko.py`).

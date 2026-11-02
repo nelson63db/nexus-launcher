@@ -43,6 +43,55 @@ Tabulia: consultar, guardar, avisos, cambios de estructura). No hay copia local:
 una, aparece sola. Las que solo leen se ejecutan sin confirmar (vienen marcadas en el catálogo MCP). La guía del
 lenguaje de consultas también llega del servidor y entra en el prompt de sistema.
 
+### Rocko con Claude (`rocko_claude_worker.py`)
+
+Mientras el proyecto `reco` está abierto en el launcher, **Rocko (el bot de Telegram) contesta con la
+suscripción de Claude de esta máquina** en lugar de con Gemini. El panel «Chat» lo arranca solo
+(`--background`) y el proceso se cierra cuando se cierra ese panel.
+
+```
+Telegram → VPS (cola de Rocko) ◄── este proceso pregunta cada 2 s
+                               ──► el mensaje + instrucciones de Rocko
+          claude -p --model sonnet --effort low  (tools de reco por MCP)
+                               ──► respuesta
+```
+
+- Usa la cuenta **personal** (`CLAUDE_CONFIG_DIR=~/.claude-personal`; se niega a usar `~/.claude`) y quita
+  `ANTHROPIC_API_KEY` del entorno: siempre la suscripción, nunca una API de pago.
+- Corre en `~/.cache/rocko-claude/` (carpeta vacía), sin hooks ni ajustes del usuario (`--setting-sources ''`),
+  sin herramientas de archivos ni terminal (`--tools ''`) y sin guardar la sesión: solo las tools de reco.
+- Si esta máquina se apaga, se duerme o se cierra el panel, en ~15 s el servidor contesta con Gemini
+  (`gemini-flash-latest` → `gemini-flash-lite-latest`) y reintenta hasta que alguno pueda. Los audios van
+  siempre a Gemini (Claude no oye).
+- Si se acaba la cuota de Claude, el servidor no le manda nada a esta máquina por 30 min.
+
+```sh
+python3 rocko_claude_worker.py --status          # ¿corre? ¿qué ve el servidor?
+python3 rocko_claude_worker.py --stop
+python3 rocko_claude_worker.py --background --model opus --effort medium   # otro modelo
+tail -f ~/.cache/rocko-claude/worker.log
+```
+
+**También atiende a EasyDoc** (desde la versión 2 del worker): mientras esté corriendo, los documentos que
+generan en `smart-web-dev.com/easydoc` los superusers —y los usuarios a los que les diste la clave de permiso
+`use_claude_sonnet` en el admin de Django— los escribe Claude Sonnet con esfuerzo **alto** en esta máquina,
+y el navegador va viendo el texto mientras se escribe. Sin esta máquina, EasyDoc usa Gemini (flash → flash-lite).
+Cada documento corre en su propio hilo (hasta 2 a la vez) con el modelo/esfuerzo que pide el servidor, sin tools
+ni MCP; Rocko sigue con el suyo (`low`). Si el usuario pulsa Detener o cierra la pestaña, el proceso se mata.
+
+```sh
+python3 rocko_claude_worker.py --background --no-easydoc     # solo Rocko
+python3 rocko_claude_worker.py --background --easydoc-slots 1 # un documento a la vez
+ROCKO_CLAUDE_STATE_DIR=/tmp/x python3 rocko_claude_worker.py  # 2ª instancia de prueba (otro lock/pid/log)
+```
+
+⚠️ Un worker en marcha no recarga el archivo: tras actualizarlo, `--stop` y reabrir el panel «Chat» de reco.
+Nunca pares el worker con `pkill`/`kill` por patrón (puede llevarse otros procesos): `--stop` o el PID de `--status`.
+
+Variables: `ROCKO_CLAUDE_MODEL` (default `sonnet`), `ROCKO_CLAUDE_EFFORT` (default `low`). En Telegram,
+`/motor` dice quién está contestando. Del lado del servidor: SWDprod `reco/rocko_queue.py` y
+`docs-ia/infra/reco-vps.md` § «Quién contesta» (hace falta el worker `swd-reco-rocko` en la VPS).
+
 ### Comandos del chat
 
 | Comando | Qué hace |
