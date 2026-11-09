@@ -18,6 +18,9 @@ from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import swd_registry  # puertos fijos y perfiles de agente (~/.config/swd-bridge/registry.json)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANSI COLOR CODES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -369,6 +372,71 @@ class Project:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# AGENT PICKER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _pick(title, options, allow_default=False):
+    """Menú numerado → índice elegido; None = Enter (valor por defecto, solo si se permite); -1 = cancelar."""
+    print(f"\n  {C.YELLOW}{title}{C.RESET}")
+    for i, label in enumerate(options, 1):
+        print(f"    {C.CYAN}{i}{C.RESET}  {label}")
+    hint = "Enter = por defecto, " if allow_default else ""
+    while True:
+        raw = input(f"  {C.DIM}{hint}número, q cancela{C.RESET} > ").strip().lower()
+        if raw == 'q':
+            return -1
+        if raw == '' and allow_default:
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+
+
+def choose_agent(project):
+    """Pregunta qué agente abrir en el panel principal. Enter = ninguno (como siempre). → spec o None."""
+    profs = swd_registry.profiles()
+    names = list(profs)
+    print(f"\n  {C.YELLOW}Agente para {project.alias}{C.RESET}   {C.DIM}(Enter = ninguno){C.RESET}")
+    for i, name in enumerate(names, 1):
+        print(f"    {C.CYAN}{i}{C.RESET}  {name:<14}{C.DIM}{swd_registry.describe(profs[name])}{C.RESET}")
+    print(f"    {C.CYAN}o{C.RESET}  otro: elegir proveedor, modelo y esfuerzo entre todos los del CLI")
+    while True:
+        raw = input(f"  > ").strip().lower()
+        if raw == '':
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(names):
+            return profs[names[int(raw) - 1]]
+        if raw in names:
+            return profs[raw]
+        if raw == 'o':
+            break
+    prov = _pick("Proveedor", ["Claude", "Codex"])
+    if prov < 0:
+        return None
+    if prov == 0:
+        cat = swd_registry.claude_catalog()
+        model_i = _pick("Modelo de Claude", cat['models'])
+        if model_i < 0:
+            return None
+        eff_i = _pick("Esfuerzo", cat['efforts'], allow_default=True)
+        if eff_i is not None and eff_i < 0:
+            return None
+        return {'provider': 'claude', 'model': cat['models'][model_i],
+                'effort': cat['efforts'][eff_i] if eff_i is not None else None}
+    models = swd_registry.codex_catalog()
+    if not models:
+        show_warning("No encontré la lista de modelos de Codex (~/.codex/models_cache.json). Abre Codex una vez.")
+        return None
+    model_i = _pick("Modelo de Codex", [f"{m['slug']:<16}{C.DIM}{m['name']}{C.RESET}" for m in models])
+    if model_i < 0:
+        return None
+    m = models[model_i]
+    eff_i = _pick(f"Esfuerzo ({m['slug']})", m['efforts'], allow_default=True)
+    if eff_i is not None and eff_i < 0:
+        return None
+    return {'provider': 'codex', 'model': m['slug'], 'effort': m['efforts'][eff_i] if eff_i is not None else None}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PROJECT MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -497,19 +565,33 @@ class TmuxOrchestrator:
             return False
         return True
 
-    def _build_cmds(self, project, pane_conf):
+    def _build_cmds(self, project, pane_conf, port=None):
         """Build command list for a pane based on its config."""
         cmds = []
         if pane_conf.use_cd:
             cmds.append(f"cd {shlex.quote(os.path.expanduser(project.path))}")
         if pane_conf.use_venv:
             cmds.append(project.activation_cmd)
+        if port:
+            cmds.append(f"export PORT={port}")   # en TODOS los paneles: el agente y el shell ven el mismo puerto
 
         cmds.append("clear")
 
         if pane_conf.custom_cmd:
             cmds.append(pane_conf.custom_cmd)
         return cmds
+
+    def _project_port(self, project):
+        """El puerto del proyecto si algún panel lo usa (`$PORT` en su comando); si no, None (no gasta uno del rango)."""
+        if any('$PORT' in (c.custom_cmd or '') for c in project.panes_config):
+            return swd_registry.port_for(project.alias)
+        return None
+
+    @staticmethod
+    def _busy_message(project, port, owner):
+        who = f"{owner['command']} (pid {owner['pid']}" + (f", {owner['cwd']}" if owner['cwd'] else '') + ')'
+        return (f"echo '⚠ {project.alias}: el puerto {port} ya lo usa {who}. "
+                f"No arranco el servidor. Ciérralo (kill {owner['pid']}) y repite el comando.'")
 
     def _send_keys(self, pane_target, commands):
         for cmd in commands:
@@ -520,8 +602,10 @@ class TmuxOrchestrator:
         res = subprocess.run(['tmux'] + args, capture_output=True, text=True)
         return res.stdout.strip() if res.returncode == 0 else None
 
-    def launch_layout(self, project):
-        """Build the project's pane layout and run each pane's configured command."""
+    def launch_layout(self, project, agent_spec=None):
+        """Build the project's pane layout and run each pane's configured command.
+
+        `agent_spec` (perfil de swd_registry) arranca el agente en el panel principal con modelo y esfuerzo."""
         if not self.check_tmux_session():
             return False
 
@@ -546,11 +630,30 @@ class TmuxOrchestrator:
         n = len(project.panes_config)
         mapping = [(0, 0), (1, 1)] if n == 2 else [(0, 0), (1, 2), (2, 1)]
 
+        port = self._project_port(project)
+        owner = swd_registry.listening(port) if port else None
+        agent_cmd = None
+        if agent_spec:
+            try:
+                agent_cmd = swd_registry.agent_command(agent_spec, project.path)
+            except ValueError as exc:
+                show_warning(str(exc))
+
         for pane_idx, conf_idx in mapping:
             if conf_idx >= n:
                 continue
-            cmds = self._build_cmds(project, project.panes_config[conf_idx])
+            conf = project.panes_config[conf_idx]
+            cmds = self._build_cmds(project, conf, port)
+            if owner and '$PORT' in (conf.custom_cmd or ''):
+                cmds[-1] = self._busy_message(project, port, owner)     # no pisar un servidor ajeno
+                show_warning(f"Puerto {port} ocupado por {owner['command']} (pid {owner['pid']})")
+            if pane_idx == 0 and agent_cmd:
+                cmds.append(agent_cmd)
             self._send_keys(f"{win}.{pane_idx}", cmds)
+        if port:
+            show_info(f"Puerto de {project.alias}: {C.CYAN}{port}{C.RESET}  (export PORT={port})")
+        if agent_cmd:
+            show_info(f"Agente: {C.CYAN}{swd_registry.describe(agent_spec)}{C.RESET}")
 
         # Rename window and set focus on the main pane
         subprocess.run(['tmux', 'rename-window', '-t', win, project.alias],
@@ -1256,7 +1359,7 @@ class NexusApp:
                     # Try to launch a project
                     project = self.manager.get_project(choice)
                     if project:
-                        if self.tmux.launch_layout(project):
+                        if self.tmux.launch_layout(project, choose_agent(project)):
                             break  # Exit after launching
                     else:
                         show_error(f"Project '{choice}' not found")
@@ -1281,6 +1384,16 @@ def main():
 
     app = NexusApp()
 
+    # --profile NAME (cualquier posición): agente a abrir en el panel principal. --profile none = ninguno.
+    profile_name = None
+    if '--profile' in sys.argv:
+        i = sys.argv.index('--profile')
+        profile_name = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+        del sys.argv[i:i + 2]
+        if profile_name and profile_name != 'none' and profile_name not in swd_registry.profiles():
+            show_error(f"Perfil '{profile_name}' no existe. Disponibles: {', '.join(swd_registry.profiles())}")
+            return 1
+
     # Check for command line arguments for quick launch
     if len(sys.argv) > 1:
         arg = sys.argv[1]
@@ -1294,6 +1407,7 @@ def main():
   nexus <project>          Quick launch project by alias/number
   nexus --no-boot          Skip boot animation
   nexus --list             List all projects
+  nexus <project> --profile NAME   Open the project with an agent (swd_registry.py profiles)
   nexus --help             Show this help
 
 {C.YELLOW}Examples:{C.RESET}
@@ -1322,7 +1436,8 @@ def main():
             project = app.manager.get_project(arg)
             if project:
                 print(f"\n  {C.CYAN}Quick launching:{C.RESET} {project.alias}")
-                app.tmux.launch_layout(project)
+                spec = swd_registry.profiles().get(profile_name) if profile_name else None
+                app.tmux.launch_layout(project, spec)
                 return 0
             else:
                 show_error(f"Project '{arg}' not found")
