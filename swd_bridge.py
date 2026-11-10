@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""swd-bridge: el puente entre esta laptop y smart-web-dev.com para mirar (y en F3, manejar) tmux desde el
+"""swd-bridge: el puente entre esta laptop y smart-web-dev.com para mirar y manejar tmux desde el
 teléfono o el Kindle. Plan y modelo de amenaza: SWDprod `docs-ia/plan-control-remoto.md`; servidor: app `remote`.
 
     teléfono/Kindle ──► VPS /remote/ (2FA) ◄── esta laptop pregunta cada 2–10 s («¿hay algo para mí?»)
 
 La laptop NUNCA escucha en la red: solo abre conexiones hacia la VPS. Ejecuta únicamente un vocabulario CERRADO
 de verbos, validado acá otra vez aunque la VPS ya lo validó (si la VPS cayera en malas manos, no puede pedir más
-que esto). F2 = solo lectura:
+que esto).
 
+    Lectura:
     capture <pane> [lines]      pantalla de un panel
     server-log <window> [lines] el panel del servidor de un proyecto
     git-status <window>         status + últimos commits del repo de esa ventana
     git-diff <window> [mode]    stat | full | staged (sin rutas ni opciones libres)
+    Escritura (F3; la VPS exige 2FA reciente, y acá se rechaza una escritura que llegue con más de 45 s):
+    send <pane> <text>          pega el texto en un panel de AGENTE (claude/codex, comprobado en vivo) + Enter
+    key <pane> <key>            una tecla de una lista fija a un panel de agente
+    server-restart <window>     Ctrl-C + el comando de servidor del proyecto, leído de ESTE projects.json
+    start <project> <profile>   abre el proyecto con el launcher, agente SIN saltarse permisos (--remote)
+    No hay verbo que ejecute un texto como comando: la shell libre está apagada.
 
 Uso:
     python3 swd_bridge.py                  # en primer plano (Ctrl+C sale)
@@ -33,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -43,7 +51,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '1'
+VERSION = '2'
 BRIDGE_DIR = Path(os.environ.get('SWD_BRIDGE_DIR') or Path.home() / '.config' / 'swd-bridge')
 ENV_FILE = BRIDGE_DIR / 'bridge.env'
 STATE_DIR = BRIDGE_DIR / 'state'          # lo escriben los hooks de Claude/Codex (swd_bridge_hook.py)
@@ -57,6 +65,13 @@ DISABLED_BACKOFF = 30.0
 FULL_SNAPSHOT_EVERY = 60.0      # s: aunque nada cambie, se manda la foto entera de vez en cuando
 MAX_OUTPUT = 200 * 1024
 AGENT_COMMANDS = {'claude', 'codex'}
+SHELLS = {'zsh', '-zsh', 'bash', '-bash', 'sh', 'fish', 'login'}
+WRITE_MAX_AGE = 45.0            # s: una escritura que llega más tarde (laptop dormida, red) no se ejecuta
+HERE = Path(__file__).resolve().parent
+LAUNCHER = Path(os.environ.get('SWD_BRIDGE_LAUNCHER') or HERE / 'nexus-launcher.py')   # override solo para pruebas
+PROJECTS_FILE = Path(os.environ.get('SWD_BRIDGE_PROJECTS') or HERE / 'nexus-private' / 'projects.json')
+# Para las pruebas: otro servidor de tmux (`tmux -L <nombre>`), así nunca se toca la sesión real.
+TMUX = ['tmux'] + (['-L', os.environ['SWD_BRIDGE_TMUX_SOCKET']] if os.environ.get('SWD_BRIDGE_TMUX_SOCKET') else [])
 
 # ---- Vocabulario (MISMO contrato que SWDprod remote/verbs.py) --------------------------------------------
 PANE_RE = re.compile(r'^%\d{1,6}$')
@@ -68,7 +83,17 @@ VERBS = {
     'server-log': ('window', 'lines'),
     'git-status': ('window',),
     'git-diff': ('window', 'mode'),
+    'send': ('pane', 'text'),
+    'key': ('pane', 'key'),
+    'server-restart': ('window',),
+    'start': ('project', 'profile'),
 }
+WRITE_VERBS = frozenset({'send', 'key', 'server-restart', 'start'})
+MAX_TEXT = 4000
+KEYS = ('enter', 'esc', 'ctrl-c', 'y', 'n', '1', '2', '3', '4', 'up', 'down', 'tab', 'shift-tab')
+NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$')
+TMUX_KEYS = {'enter': 'Enter', 'esc': 'Escape', 'ctrl-c': 'C-c', 'y': 'y', 'n': 'n', '1': '1', '2': '2', '3': '3',
+             '4': '4', 'up': 'Up', 'down': 'Down', 'tab': 'Tab', 'shift-tab': 'BTab'}
 
 _stop = False
 
@@ -106,7 +131,31 @@ def clean(verb: str, args: dict | None) -> dict:
             if value not in DIFF_MODES:
                 raise VerbError('mode inválido')
             out[name] = value
+        elif name == 'text':
+            out[name] = clean_text(value)
+        elif name == 'key':
+            if value not in KEYS:
+                raise VerbError('key inválida')
+            out[name] = value
+        elif name in ('project', 'profile'):
+            if not isinstance(value, str) or not NAME_RE.match(value):
+                raise VerbError(f'{name} inválido')
+            out[name] = value
     return out
+
+
+def clean_text(value) -> str:
+    """Igual que en la VPS: sin caracteres de control salvo salto de línea y tab (ninguna secuencia de escape llega a
+    la terminal), no vacío y con tope."""
+    if not isinstance(value, str):
+        raise VerbError('text inválido')
+    value = value.replace('\r\n', '\n').replace('\r', '\n')
+    value = ''.join(ch for ch in value if ch in '\n\t' or (ord(ch) >= 32 and ord(ch) != 127)).strip()
+    if not value:
+        raise VerbError('el texto está vacío')
+    if len(value) > MAX_TEXT:
+        raise VerbError('texto demasiado largo')
+    return value
 
 
 # ---- Secretos: se tachan antes de que nada salga de la laptop -----------------------------------------------
@@ -165,9 +214,10 @@ def _ports() -> dict:
 
 
 def snapshot() -> dict:
-    code, out = _run(['tmux', 'list-panes', '-a', '-F', FORMAT], timeout=5)
+    code, out = _run([*TMUX, 'list-panes', '-a', '-F', FORMAT], timeout=5)
     if code != 0:
-        return {'tmux': False, 'windows': [], 'ts': time.time()}
+        return {'tmux': False, 'windows': [], 'projects': sorted(load_projects()), 'profiles': _profiles(),
+                'ts': time.time()}
     ports = _ports()
     windows: dict[str, dict] = {}
     for line in out.splitlines():
@@ -197,7 +247,30 @@ def snapshot() -> dict:
                 pane['agent_state'], pane['agent_since'] = st['state'], st['since']
         win['panes'].append(pane)
     return {'tmux': True, 'windows': sorted(windows.values(), key=lambda w: (w['session'], w['index'])),
-            'ts': time.time()}
+            'projects': sorted(load_projects()), 'profiles': _profiles(), 'ts': time.time()}
+
+
+def load_projects() -> dict:
+    """alias → proyecto del launcher (projects.json de ESTA laptop: lo único que `start` y `server-restart` aceptan)."""
+    try:
+        data = json.loads(PROJECTS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {p['alias']: p for p in data if isinstance(p, dict) and NAME_RE.match(str(p.get('alias', '')))}
+
+
+def _registry():
+    sys.path.insert(0, str(HERE))
+    import swd_registry
+    return swd_registry
+
+
+def _profiles() -> dict:
+    try:
+        reg = _registry()
+        return {name: reg.describe(spec) for name, spec in reg.profiles().items()}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _find(snap: dict, *, window: str | None = None, pane: str | None = None):
@@ -211,7 +284,7 @@ def _find(snap: dict, *, window: str | None = None, pane: str | None = None):
 
 
 def _capture(pane_id: str, lines: int) -> str:
-    code, out = _run(['tmux', 'capture-pane', '-p', '-J', '-t', pane_id, '-S', f'-{lines}'], timeout=5)
+    code, out = _run([*TMUX, 'capture-pane', '-p', '-J', '-t', pane_id, '-S', f'-{lines}'], timeout=5)
     if code != 0:
         raise VerbError(f'no pude leer el panel: {out.strip()[:200]}')
     return redact(out.rstrip('\n') + '\n')
@@ -234,13 +307,126 @@ def _repo_dir(window: dict) -> str:
     return panes[0]['cwd'] if panes else ''
 
 
+def _pane_command(pane_id: str) -> str:
+    code, out = _run([*TMUX, 'display-message', '-p', '-t', pane_id, '#{pane_current_command}'], timeout=5)
+    return out.strip() if code == 0 else ''
+
+
+def _tmux_ok(*args: str, stdin: str | None = None) -> None:
+    try:
+        res = subprocess.run([*TMUX, *args], input=stdin, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise VerbError(f'tmux falló: {exc}') from None
+    if res.returncode != 0:
+        raise VerbError(f'tmux falló: {(res.stderr or res.stdout).strip()[:200]}')
+
+
+def _require_agent(pane_id: str, snap: dict) -> None:
+    _find(snap, pane=pane_id)
+    cmd = _pane_command(pane_id)                 # EN VIVO, no la foto: el agente pudo haber salido hace un segundo
+    if cmd not in AGENT_COMMANDS:
+        raise VerbError(f'ese panel ya no tiene un agente (corre «{cmd or "?"}»): no se escribe en una terminal')
+
+
+def _send(pane_id: str, text: str, snap: dict) -> str:
+    _require_agent(pane_id, snap)
+    # Pegado con «bracketed paste» (-p): el agente recibe el texto como UN pegado, con sus saltos de línea, y recién
+    # el Enter de después lo manda. Un buffer con nombre propio que se borra al pegar (-d).
+    _tmux_ok('load-buffer', '-b', 'swd-bridge', '-', stdin=text)
+    _tmux_ok('paste-buffer', '-p', '-d', '-b', 'swd-bridge', '-t', pane_id)
+    time.sleep(0.3)
+    _tmux_ok('send-keys', '-t', pane_id, 'Enter')
+    return f'enviado ({len(text)} caracteres)\n'
+
+
+def _key(pane_id: str, key: str, snap: dict) -> str:
+    _require_agent(pane_id, snap)
+    _tmux_ok('send-keys', '-t', pane_id, TMUX_KEYS[key])
+    return f'tecla {key} enviada\n'
+
+
+def _wait_for_shell(pane_id: str, seconds: float) -> bool:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if _pane_command(pane_id) in SHELLS:
+            return True
+        time.sleep(0.3)
+    return _pane_command(pane_id) in SHELLS
+
+
+def _server_restart(window: dict) -> str:
+    server = next((p for p in window['panes'] if p['role'] == 'server'), None)
+    if not server:
+        raise VerbError('esa ventana no tiene panel de servidor')
+    project = load_projects().get(window['name'])
+    panes = (project or {}).get('panes_config') or []
+    cmd = (panes[1].get('custom_cmd') if len(panes) >= 2 else '') or ''
+    if not cmd:
+        raise VerbError(f'«{window["name"]}» no tiene comando de servidor en projects.json')
+    pane = server['id']
+    if _pane_command(pane) not in SHELLS:
+        _tmux_ok('send-keys', '-t', pane, 'C-c')
+        if not _wait_for_shell(pane, 8):
+            _tmux_ok('send-keys', '-t', pane, 'C-c')
+            if not _wait_for_shell(pane, 4):
+                raise VerbError('el servidor no se detuvo con Ctrl-C; revísalo en la laptop')
+    port = None
+    try:
+        reg = _registry()
+        port = {**reg.PINNED_PORTS, **reg.load().get('ports', {})}.get(window['name'])
+    except Exception:  # noqa: BLE001
+        pass
+    if '$PORT' in cmd and port:
+        _tmux_ok('send-keys', '-t', pane, '-l', f'export PORT={int(port)}')
+        _tmux_ok('send-keys', '-t', pane, 'Enter')
+    _tmux_ok('send-keys', '-t', pane, '-l', cmd)        # el comando de projects.json, nunca uno que venga de la VPS
+    _tmux_ok('send-keys', '-t', pane, 'Enter')
+    time.sleep(2.5)
+    return f'reiniciado: {cmd}\n\n' + _capture(pane, 15)
+
+
+def _start(project: str, profile: str, snap: dict) -> str:
+    if project not in load_projects():
+        raise VerbError(f'«{project}» no está en projects.json')
+    if profile not in _registry().profiles():
+        raise VerbError(f'el perfil «{profile}» no existe')
+    already = next((w for w in snap.get('windows', []) if w['name'] == project), None)
+    if already:
+        raise VerbError(f'«{project}» ya está abierto (ventana {already["id"]})')
+    code, out = _run([*TMUX, 'list-sessions', '-F', '#{session_last_attached}\t#{session_name}'], timeout=5)
+    sessions = sorted((line.split('\t') for line in out.splitlines() if '\t' in line), reverse=True) if code == 0 else []
+    if sessions:
+        session = sessions[0][1]
+    else:
+        session = 'remote'
+        _tmux_ok('new-session', '-d', '-s', session, '-c', str(Path.home()))
+    launch = (f'python3 {shlex.quote(str(LAUNCHER))} {shlex.quote(project)} --profile {shlex.quote(profile)} '
+              f'--remote; exec zsh')
+    try:
+        res = subprocess.run([*TMUX, 'new-window', '-d', '-P', '-F', '#{window_id}', '-t', f'{session}:', '-n',
+                              project, '-c', str(HERE), launch], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise VerbError(f'tmux falló: {exc}') from None
+    if res.returncode != 0:
+        raise VerbError(f'tmux falló: {res.stderr.strip()[:200]}')
+    return f'abierto «{project}» con {profile} en la ventana {res.stdout.strip()} (sesión {session})\n'
+
+
 def execute(verb: str, args: dict, snap: dict | None = None) -> str:
     args = clean(verb, args)
     snap = snap or snapshot()
+    if verb == 'send':
+        return _send(args['pane'], args['text'], snap)
+    if verb == 'key':
+        return _key(args['pane'], args['key'], snap)
+    if verb == 'start':
+        return _start(args['project'], args['profile'], snap)
     if verb == 'capture':
         _find(snap, pane=args['pane'])
         return _capture(args['pane'], args['lines'])
     window = _find(snap, window=args['window'])
+    if verb == 'server-restart':
+        return _server_restart(window)
     if verb == 'server-log':
         server = next((p for p in window['panes'] if p['role'] == 'server'), None)
         if not server:
@@ -314,6 +500,8 @@ def audit(entry: dict) -> None:
 def handle(url: str, token: str, job: dict, snap: dict) -> None:
     verb, args = job.get('verb', ''), job.get('args') or {}
     try:
+        if verb in WRITE_VERBS and float(job.get('age') or 0) > WRITE_MAX_AGE:
+            raise VerbError(f'llegó tarde ({job.get("age")} s): no se ejecuta una escritura vieja')
         out, ok, err = execute(verb, args, snap), True, ''
     except VerbError as exc:
         out, ok, err = '', False, str(exc)
@@ -330,7 +518,7 @@ def handle(url: str, token: str, job: dict, snap: dict) -> None:
 def serve(once: bool = False) -> None:
     url, token = load_env()
     host = socket.gethostname().split('.')[0]
-    log(f'swd-bridge v{VERSION} → {url} (solo lectura). Apagado de emergencia: touch {DISABLED}')
+    log(f'swd-bridge v{VERSION} → {url} . Apagado de emergencia: touch {DISABLED}')
     last_hash, last_full, warned = '', 0.0, ''
     while not _stop:
         if DISABLED.exists():
@@ -395,7 +583,7 @@ def _lock():
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description='Puente laptop ↔ smart-web-dev.com (solo lectura).')
+    p = argparse.ArgumentParser(description='Puente laptop ↔ smart-web-dev.com.')
     p.add_argument('--background', action='store_true')
     p.add_argument('--status', action='store_true')
     p.add_argument('--stop', action='store_true')

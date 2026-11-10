@@ -188,12 +188,20 @@ def claude_account_alias(project_path: str) -> str:
     return 'claudet' if WORK_ROOT in (p, *p.parents) else 'claudep'
 
 
-def agent_command(spec: dict, project_path: str = '~') -> str:
+# Abierto desde el teléfono (swd-bridge, verbo `start`): SIN --dangerously-skip-permissions. Un agente que alguien
+# puede dirigir a distancia, y que lee repos/webs con texto ajeno, no ejecuta nada sin que lo apruebes (desde el
+# teléfono, con 1 / y). Plan: docs-ia/plan-control-remoto.md §3.3.
+CLAUDE_REMOTE = {'claudep': 'CLAUDE_CONFIG_DIR=~/.claude-personal claude', 'claudet': 'claude'}
+
+
+def agent_command(spec: dict, project_path: str = '~', remote: bool = False) -> str:
     """El comando que se escribe en el panel. Usa los alias de .zshrc (claudep/claudet/codext) para no
-    duplicar sus banderas: si cambias un alias, el launcher lo sigue."""
+    duplicar sus banderas: si cambias un alias, el launcher lo sigue. `remote=True` = abierto desde el teléfono:
+    Claude arranca pidiendo permiso para cada acción (sin el alias, que se los salta)."""
     provider, effort = spec['provider'], spec.get('effort')
     if provider == 'claude':
-        cmd = f"{claude_account_alias(project_path)} --model {spec['model']}"
+        alias = claude_account_alias(project_path)
+        cmd = f"{CLAUDE_REMOTE[alias] if remote else alias} --model {spec['model']}"
         return cmd + (f' --effort {effort}' if effort else '')
     model = spec.get('model') or resolve_codex_family(spec.get('family', ''))
     if not model:

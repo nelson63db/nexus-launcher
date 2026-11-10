@@ -602,7 +602,7 @@ class TmuxOrchestrator:
         res = subprocess.run(['tmux'] + args, capture_output=True, text=True)
         return res.stdout.strip() if res.returncode == 0 else None
 
-    def launch_layout(self, project, agent_spec=None):
+    def launch_layout(self, project, agent_spec=None, remote=False):
         """Build the project's pane layout and run each pane's configured command.
 
         `agent_spec` (perfil de swd_registry) arranca el agente en el panel principal con modelo y esfuerzo."""
@@ -635,7 +635,7 @@ class TmuxOrchestrator:
         agent_cmd = None
         if agent_spec:
             try:
-                agent_cmd = swd_registry.agent_command(agent_spec, project.path)
+                agent_cmd = swd_registry.agent_command(agent_spec, project.path, remote=remote)
             except ValueError as exc:
                 show_warning(str(exc))
 
@@ -1384,6 +1384,10 @@ def main():
 
     app = NexusApp()
 
+    # --remote: lo abrió swd-bridge desde el teléfono → el agente arranca pidiendo permisos (ver swd_registry).
+    remote = '--remote' in sys.argv
+    if remote:
+        sys.argv.remove('--remote')
     # --profile NAME (cualquier posición): agente a abrir en el panel principal. --profile none = ninguno.
     profile_name = None
     if '--profile' in sys.argv:
@@ -1437,7 +1441,7 @@ def main():
             if project:
                 print(f"\n  {C.CYAN}Quick launching:{C.RESET} {project.alias}")
                 spec = swd_registry.profiles().get(profile_name) if profile_name else None
-                app.tmux.launch_layout(project, spec)
+                app.tmux.launch_layout(project, spec, remote=remote)
                 return 0
             else:
                 show_error(f"Project '{arg}' not found")
