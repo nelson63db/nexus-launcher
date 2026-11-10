@@ -385,6 +385,17 @@ def _server_restart(window: dict) -> str:
     return f'reiniciado: {cmd}\n\n' + _capture(pane, 15)
 
 
+def _wait_panes(window_id: str, expected: int, seconds: float) -> bool:
+    """¿La ventana nueva llegó a tener sus paneles? El launcher los arma después de abrir la ventana."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        code, out = _run([*TMUX, 'list-panes', '-t', window_id, '-F', '#{pane_id}'], timeout=5)
+        if code == 0 and len(out.split()) >= expected:
+            return True
+        time.sleep(0.4)
+    return False
+
+
 def _start(project: str, profile: str, snap: dict) -> str:
     if project not in load_projects():
         raise VerbError(f'«{project}» no está en projects.json')
@@ -409,7 +420,12 @@ def _start(project: str, profile: str, snap: dict) -> str:
         raise VerbError(f'tmux falló: {exc}') from None
     if res.returncode != 0:
         raise VerbError(f'tmux falló: {res.stderr.strip()[:200]}')
-    return f'abierto «{project}» con {profile} en la ventana {res.stdout.strip()} (sesión {session})\n'
+    new_window = res.stdout.strip()
+    expected = {2: 2, 3: 3}.get(len((load_projects().get(project) or {}).get('panes_config') or []), 1)
+    if not _wait_panes(new_window, expected, 10):
+        raise VerbError(f'la ventana {new_window} se abrió pero no tiene los {expected} paneles de «{project}»; '
+                        f'revísala en la laptop')
+    return (f'abierto «{project}» con {profile} en la ventana {new_window} ({expected} paneles, sesión {session})\n')
 
 
 def execute(verb: str, args: dict, snap: dict | None = None) -> str:

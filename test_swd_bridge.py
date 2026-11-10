@@ -235,3 +235,66 @@ class LiveTmuxTests(unittest.TestCase):
             b.call, b.audit = orig_call, orig_audit
         self.assertFalse(calls[0]['ok'])
         self.assertIn('llegó tarde', calls[0]['error'])
+
+
+@unittest.skipUnless(subprocess.run(['which', 'tmux'], capture_output=True).returncode == 0, 'sin tmux')
+class StartDoesNotTouchOtherWindowsTests(unittest.TestCase):
+    """Regresión 2026-11-10: al abrir un proyecto desde el teléfono, el launcher dividió y renombró la ventana donde
+    estaba el cursor (la de otro proyecto) en vez de la ventana nueva. Acá corre el launcher REAL contra un tmux propio:
+    la ventana «activa» (la del cursor) tiene que quedar exactamente como estaba."""
+    SOCK = f'swdbridge-start-{os.getpid()}'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        t = Path(cls.tmp.name)
+        (t / 'priv').mkdir()
+        (t / 'zdot').mkdir()                                  # zsh sin .zshrc: sin los alias de agentes (claudep/codext)
+        pane = lambda name, cmd=None: {'name': name, 'use_cd': True, 'use_venv': False, 'custom_cmd': cmd}   # noqa: E731
+        projects = [{'alias': 'otro', 'path': str(t), 'venv_path': str(t / 'venv'), 'panes_config': [
+            pane('Main'), pane('Server', 'echo servidor en $PORT'), pane('Extra')]}]
+        (t / 'priv' / 'projects.json').write_text(json.dumps(projects))
+        (t / 'registry.json').write_text(json.dumps({'ports': {'otro': 18311}, 'profiles': {}}))
+        cls.env = {**os.environ, 'SWD_BRIDGE_TMUX_SOCKET': cls.SOCK, 'SWD_BRIDGE_PROJECTS': str(t / 'priv' / 'projects.json'),
+                   'NEXUS_PRIVATE_DIR': str(t / 'priv'), 'SWD_REGISTRY': str(t / 'registry.json'),
+                   'SWD_BRIDGE_DIR': str(t), 'ZDOTDIR': str(t / 'zdot'), 'SHELL': '/bin/zsh'}
+        tm = ['tmux', '-L', cls.SOCK, '-f', '/dev/null']
+        cls.active = subprocess.run([*tm, 'new-session', '-d', '-P', '-F', '#{window_id}', '-s', 't', '-n', 'obsidian',
+                                     '-x', '160', '-y', '40', '-c', str(t)], check=True, capture_output=True, text=True,
+                                    env=cls.env).stdout.strip()
+
+    @classmethod
+    def tearDownClass(cls):
+        subprocess.run(['tmux', '-L', cls.SOCK, 'kill-server'], capture_output=True)
+        cls.tmp.cleanup()
+
+    def tmux(self, *a):
+        return subprocess.run(['tmux', '-L', self.SOCK, *a], capture_output=True, text=True).stdout.strip()
+
+    def test_the_active_window_is_left_alone_and_the_new_one_gets_the_layout(self):
+        before_panes = self.tmux('list-panes', '-t', self.active, '-F', '#{pane_id}')
+        r = subprocess.run([sys.executable, str(HERE / 'swd_bridge.py'), '--exec', 'start', 'project=otro',
+                            'profile=luna-bajo'], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # la ventana del «cursor»: mismos paneles, mismo nombre
+        self.assertEqual(self.tmux('list-panes', '-t', self.active, '-F', '#{pane_id}'), before_panes)
+        self.assertEqual(len(before_panes.split()), 1)
+        self.assertEqual(self.tmux('display-message', '-p', '-t', self.active, '#{window_name}'), 'obsidian')
+        # la ventana nueva: el layout de 3 paneles y el nombre del proyecto
+        wins = self.tmux('list-windows', '-F', '#{window_id} #{window_name} #{window_panes}').splitlines()
+        new = [w.split() for w in wins if w.split()[0] != self.active]
+        self.assertEqual(len(new), 1, wins)
+        self.assertEqual((new[0][1], new[0][2]), ('otro', '3'))
+        self.assertIn('3 paneles', r.stdout)                                   # el resultado dice cuántos paneles se armaron
+
+    def test_remote_launch_refuses_to_split_a_window_that_already_has_panes(self):
+        self.tmux('split-window', '-d', '-t', self.active)
+        try:
+            pane = self.tmux('list-panes', '-t', self.active, '-F', '#{pane_id}').split()[0]
+            r = subprocess.run([sys.executable, str(HERE / 'nexus-launcher.py'), 'otro', '--profile', 'luna-bajo', '--remote'],
+                               env={**self.env, 'TMUX_PANE': pane, 'TMUX': self.tmux('display-message', '-p', '#{socket_path},0,0')},
+                               capture_output=True, text=True, timeout=30)
+            self.assertIn('no la divido', r.stdout + r.stderr)
+            self.assertEqual(len(self.tmux('list-panes', '-t', self.active, '-F', '#{pane_id}').split()), 2)
+        finally:
+            self.tmux('kill-pane', '-t', self.tmux('list-panes', '-t', self.active, '-F', '#{pane_id}').split()[-1])

@@ -101,7 +101,7 @@ MATRIX_CHARS = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅ�
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
 # Private data directory (excluded from public git)
-PRIVATE_DIR = SCRIPT_DIR / "nexus-private"
+PRIVATE_DIR = Path(os.environ.get("NEXUS_PRIVATE_DIR") or SCRIPT_DIR / "nexus-private")   # override: pruebas
 
 # Paths for user data
 DATA_FILE = PRIVATE_DIR / "projects.json"
@@ -611,10 +611,21 @@ class TmuxOrchestrator:
 
         show_info(f"Launching layout for {C.CYAN}{project.alias}{C.RESET}...")
 
-        win = self._tmux_id(['display-message', '-p', '#{window_id}'])
+        # La ventana de ESTE panel (TMUX_PANE), no «la ventana actual»: sin `-t`, tmux elige la ventana donde está el
+        # cursor del cliente, que puede ser otra (se divideron y renombraron las de otro proyecto al abrir uno desde el
+        # teléfono, 2026-11-10).
+        own_pane = os.environ.get('TMUX_PANE')
+        win = (self._tmux_id(['display-message', '-p', '-t', own_pane, '#{window_id}']) if own_pane
+               else self._tmux_id(['display-message', '-p', '#{window_id}']))
         if not win:
             show_error("Could not resolve the target tmux window")
             return False
+        if remote:
+            # Abierto desde el teléfono: la ventana tiene que ser NUEVA (un solo panel). Nunca dividir la de alguien.
+            panes = self._tmux_id(['list-panes', '-t', win, '-F', '#{pane_id}']) or ''
+            if len(panes.split()) != 1:
+                show_error(f"La ventana {win} ya tiene {len(panes.split())} paneles: no la divido.")
+                return False
 
         # Execute splits
         for split in project.layout_splits:
